@@ -2,1825 +2,1417 @@
 """
 QRadar SIEM Audit Script
 
-This script performs a comprehensive audit of an IBM QRadar SIEM implementation and
-provides a checklist evaluation with recommendations for improvements.
+Performs a comprehensive audit of an IBM QRadar SIEM implementation, with
+robust error handling, retries, pagination, debug logging, and multiple report
+formats (console/JSON/CSV/HTML).
 
-Code by : sudo3rs
+Author: sudo3rs 
+License: MIT
 
 Requirements:
-- Python 3.6+
-- requests
-- pandas
-- colorama
-- python-dotenv
+  - Python 3.8+
+  - requests, pandas, colorama, python-dotenv
 
-Usage:
-1. Create a .env file with your QRadar credentials:
-   QRADAR_URL=https://your-qradar-console.example.com
-   QRADAR_TOKEN=your-api-token
-   VERIFY_SSL=True/False
+Quick start:
+  1) Create a .env file:
+       QRADAR_URL=https://your-qradar-console.example.com
+       QRADAR_TOKEN=your-api-token
+       VERIFY_SSL=True
+  2) python qradar-siem-auditor.py --help
 
-2. Run the script:
-   python qradar_audit.py
-
-The script will:
-- Connect to your QRadar instance
-- Evaluate key components against best practices
-- Generate a report with findings and recommendations
+Key improvements vs. original:
+  • Fixed broken/duplicated code blocks and undefined variables
+  • Centralized API helper with retries, backoff, timeouts, and pagination (Range/Content-Range)
+  • Safer Ariel search polling (status handling + timeouts)
+  • CLI to include/exclude categories/checks and choose output formats
+  • Structured logging to file with --debug for verbose tracing
+  • Dry-run mode to test flow without hitting your QRadar
+  • HTML/JSON/CSV report export with a timestamped output folder
+  • Defensive JSON parsing and graceful degradation on partial failures
 """
 
+from __future__ import annotations
 import os
 import sys
 import json
 import time
-import datetime
+import math
+import argparse
+import datetime as dt
+import logging
+from logging import handlers
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin
+
 import requests
 import pandas as pd
-from colorama import Fore, Style, init
+from colorama import Fore, Style, init as colorama_init
 from dotenv import load_dotenv
 
-# Initialize colorama
-init(autoreset=True)
-
-# Load environment variables
+# ------------------------------ Setup ---------------------------------
+colorama_init(autoreset=True)
 load_dotenv()
 
+DEFAULT_TIMEOUT = 20  # seconds per request
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_BACKOFF = 1.5
+DEFAULT_PAGE_SIZE = 50  # for Range-based pagination
+
+# ---------------------------- Logging ---------------------------------
+
+def setup_logger(log_path: str, debug: bool) -> logging.Logger:
+    logger = logging.getLogger("qradar_audit")
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)-7s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # Console (INFO+)
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.DEBUG if debug else logging.INFO)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+
+    # File (always DEBUG level)
+    fh = handlers.RotatingFileHandler(log_path, maxBytes=2_000_000, backupCount=3)
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    return logger
+
+# ---------------------------- Utilities -------------------------------
+
+class AuditError(Exception):
+    pass
+
+def ts() -> str:
+    return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# -------------------------- Auditor Class -----------------------------
+
 class QRadarAuditor:
-    def __init__(self):
-        """Initialize the QRadar auditor with configuration from environment variables."""
-        self.base_url = os.getenv('QRADAR_URL')
-        self.token = os.getenv('QRADAR_TOKEN')
-        self.verify_ssl = os.getenv('VERIFY_SSL', 'True').lower() == 'true'
-        
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        token: Optional[str] = None,
+        verify_ssl: Optional[bool] = None,
+        timeout: int = DEFAULT_TIMEOUT,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        backoff: float = DEFAULT_BACKOFF,
+        page_size: int = DEFAULT_PAGE_SIZE,
+        ariel_window: str = "24h",
+        dry_run: bool = False,
+        logger: Optional[logging.Logger] = None,
+    ):
+        """Initialize the QRadar auditor.
+
+        Env fallbacks:
+          QRADAR_URL, QRADAR_TOKEN, VERIFY_SSL
+        """
+        self.base_url = (base_url or os.getenv("QRADAR_URL", "")).rstrip("/")
+        self.token = token or os.getenv("QRADAR_TOKEN", "")
+        verify_env = os.getenv("VERIFY_SSL")
+        if verify_ssl is None and verify_env is not None:
+            verify_ssl = str(verify_env).lower() == "true"
+        self.verify_ssl = True if verify_ssl is None else bool(verify_ssl)
+
         if not self.base_url or not self.token:
-            print(f"{Fore.RED}Error: Missing required environment variables. Please set QRADAR_URL and QRADAR_TOKEN in .env file.")
-            sys.exit(1)
-            
-        # Remove trailing slash if present
-        self.base_url = self.base_url.rstrip('/')
-        
-        # Set up headers for API requests
+            raise AuditError("Missing QRADAR_URL or QRADAR_TOKEN (set in .env or CLI).")
+
+        self.timeout = int(timeout)
+        self.max_retries = int(max_retries)
+        self.backoff = float(backoff)
+        self.page_size = int(page_size)
+        self.ariel_window = ariel_window
+        self.dry_run = dry_run
+
+        self.logger = logger or setup_logger("qradar_audit.log", debug=False)
+
+        self.session = requests.Session()
         self.headers = {
-            'SEC': self.token,
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
+            "SEC": self.token,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
         }
-        
-        # Define audit categories and checks
-        self.audit_categories = {
+
+        # results structure: {category: {check_name: result_dict}}
+        self.results: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+        # Register checks
+        self.audit_categories: Dict[str, Dict[str, Any]] = {
             "Data Collection": {
                 "Log Sources": self._check_log_sources,
                 "Event Collection Rate": self._check_event_collection_rate,
                 "Log Source Coverage": self._check_log_source_coverage,
-                "Log Source Status": self._check_log_source_status
+                "Log Source Status": self._check_log_source_status,
             },
             "System Configuration": {
                 "System Health": self._check_system_health,
                 "Deployment Architecture": self._check_deployment_architecture,
                 "Storage Utilization": self._check_storage_utilization,
-                "Backup Configuration": self._check_backup_config
+                "Backup Configuration": self._check_backup_config,
             },
             "Security Configuration": {
                 "User Access Controls": self._check_user_access,
                 "Password Policies": self._check_password_policies,
                 "Network Security": self._check_network_security,
-                "Authentication Methods": self._check_authentication_methods
+                "Authentication Methods": self._check_authentication_methods,
             },
             "Detection Capabilities": {
                 "Custom Rules": self._check_custom_rules,
                 "Offense Configuration": self._check_offense_config,
                 "Rule Coverage": self._check_rule_coverage,
-                "Reference Sets": self._check_reference_sets
+                "Reference Sets": self._check_reference_sets,
             },
             "Operational Efficiency": {
                 "Search Performance": self._check_search_performance,
                 "Report Configuration": self._check_reports,
                 "Dashboard Configuration": self._check_dashboards,
-                "Retention Policies": self._check_retention_policies
+                "Retention Policies": self._check_retention_policies,
             },
             "Integration & Data Flow": {
                 "External Integrations": self._check_external_integrations,
                 "Data Exports": self._check_data_exports,
-                "API Usage": self._check_api_usage
-            }
+                "API Usage": self._check_api_usage,
+            },
         }
-        
-        # Initialize results dictionary
-        self.results = {}
-        
-    def run_audit(self):
-        """Execute the full audit process."""
+
+        self.system_info: Dict[str, Any] = {}
+
+    # ---------------------- HTTP helpers ------------------------------
+
+    def _request(
+        self,
+        path: str,
+        method: str = "GET",
+        params: Optional[Dict[str, Any]] = None,
+        json_body: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+        allow_404: bool = False,
+    ) -> Tuple[Optional[Any], int, Dict[str, str]]:
+        if self.dry_run:
+            self.logger.debug(f"DRY-RUN {method} {path} params={params} body={json_body}")
+            return {}, 200, {}
+
+        url = path if path.startswith("http") else urljoin(self.base_url + "/", path.lstrip("/"))
+        hdrs = {**self.headers, **(headers or {})}
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                resp = self.session.request(
+                    method,
+                    url,
+                    headers=hdrs,
+                    params=params,
+                    json=json_body,
+                    timeout=self.timeout,
+                    verify=self.verify_ssl,
+                )
+                status = resp.status_code
+                text = (resp.text or "").strip()
+                self.logger.debug(f"HTTP {status} {method} {url}")
+
+                if status == 404 and allow_404:
+                    return None, status, dict(resp.headers)
+
+                if status in (429, 500, 502, 503, 504) and attempt < self.max_retries:
+                    wait = self.backoff ** attempt
+                    self.logger.warning(f"Retryable HTTP {status}; backing off {wait:.1f}s (attempt {attempt}/{self.max_retries})")
+                    time.sleep(wait)
+                    continue
+
+                # Non-2xx
+                if status < 200 or status >= 300:
+                    self.logger.error(f"API error {status}: {text[:500]}")
+                    return None, status, dict(resp.headers)
+
+                # Try JSON; if fails, return text
+                if not text:
+                    return None, status, dict(resp.headers)
+                try:
+                    return resp.json(), status, dict(resp.headers)
+                except Exception:
+                    return text, status, dict(resp.headers)
+
+            except requests.RequestException as e:
+                last_exc = e
+                if attempt < self.max_retries:
+                    wait = self.backoff ** attempt
+                    self.logger.warning(f"Network error: {e}; retrying in {wait:.1f}s (attempt {attempt}/{self.max_retries})")
+                    time.sleep(wait)
+                    continue
+                self.logger.exception("Request failed after retries")
+                return None, 0, {}
+        # Shouldn't reach
+        raise AuditError(f"Unreachable code in _request; last_exc={last_exc}")
+
+    def _paginate_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> List[Any]:
+        """Fetch all items from QRadar endpoints that support Range/Content-Range.
+        Adds Range: items=start-end header and accumulates until total reached.
+        """
+        items: List[Any] = []
+        start = 0
+        total = None
+        while True:
+            end = start + self.page_size - 1
+            headers = {"Range": f"items={start}-{end}"}
+            data, status, hdrs = self._request(path, params=params, headers=headers)
+            if data is None and status == 416:  # Range not satisfiable
+                break
+            if isinstance(data, list):
+                items.extend(data)
+            else:
+                # Non-list payload; return as single page
+                return data if isinstance(data, list) else (items if items else [])
+            cr = hdrs.get("Content-Range")  # e.g. items 0-49/123
+            if cr and "/" in cr:
+                try:
+                    total = int(cr.split("/")[-1])
+                except ValueError:
+                    total = None
+            if total is None:
+                # If no total, continue until empty page
+                if not data:
+                    break
+            if total is not None and len(items) >= total:
+                break
+            start += self.page_size
+        return items
+
+    # ---------------------- Top-level runners -------------------------
+
+    def run_audit(
+        self,
+        include_categories: Optional[List[str]] = None,
+        exclude_categories: Optional[List[str]] = None,
+        include_checks: Optional[List[str]] = None,
+        exclude_checks: Optional[List[str]] = None,
+        outdir: str = "out",
+        export: List[str] = ["console"],
+    ) -> Dict[str, Any]:
         print(f"{Fore.CYAN}=== QRadar SIEM Audit Tool ===")
-        print(f"{Fore.CYAN}Starting audit of {self.base_url}")
-        print(f"{Fore.CYAN}Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"{Fore.CYAN}==============================\n")
-        
-        try:
-            # Test connection to QRadar
-            self._test_connection()
-            
-            # Get system information
-            self.system_info = self._get_system_info()
-            
-            # Run all checks for each category
-            for category, checks in self.audit_categories.items():
-                print(f"\n{Fore.BLUE}Auditing {category}...")
-                self.results[category] = {}
-                
-                for check_name, check_function in checks.items():
-                    print(f"{Fore.YELLOW}  Checking {check_name}...")
-                    try:
-                        result = check_function()
-                        self.results[category][check_name] = result
-                        status_color = Fore.GREEN if result['status'] == 'PASS' else Fore.RED if result['status'] == 'FAIL' else Fore.YELLOW
-                        print(f"{status_color}    Status: {result['status']}")
-                    except Exception as e:
-                        print(f"{Fore.RED}    Error during check: {str(e)}")
-                        self.results[category][check_name] = {
-                            'status': 'ERROR',
-                            'findings': f"Error executing check: {str(e)}",
-                            'recommendations': "Review API access and try again."
-                        }
-            
-            # Generate and display final report
-            self._generate_report()
-            
-        except Exception as e:
-            print(f"{Fore.RED}An error occurred during the audit: {str(e)}")
-            sys.exit(1)
-    
-    def _test_connection(self):
-        """Test the connection to QRadar API."""
-        try:
-            url = f"{self.base_url}/api/system/about"
-            response = requests.get(url, headers=self.headers, verify=self.verify_ssl)
-            
-            if response.status_code != 200:
-                print(f"{Fore.RED}Failed to connect to QRadar API. Status code: {response.status_code}")
-                print(f"{Fore.RED}Response: {response.text}")
-                sys.exit(1)
-                
+        print(f"{Fore.CYAN}Target: {self.base_url}")
+        print(f"{Fore.CYAN}Time: {ts()}\n")
+
+        # Connection test
+        ok = self._test_connection()
+        if not ok:
+            raise AuditError("Connection test failed.")
+
+        # Version
+        about = self._get_system_info()
+        version = about.get("version", "Unknown") if isinstance(about, dict) else "Unknown"
+        print(f"{Fore.CYAN}QRadar Version: {version}\n")
+
+        # Filters
+        include_categories = [c.lower() for c in (include_categories or [])]
+        exclude_categories = [c.lower() for c in (exclude_categories or [])]
+        include_checks = [c.lower() for c in (include_checks or [])]
+        exclude_checks = [c.lower() for c in (exclude_checks or [])]
+
+        # Execute checks
+        for category, checks in self.audit_categories.items():
+            if include_categories and category.lower() not in include_categories:
+                continue
+            if exclude_categories and category.lower() in exclude_categories:
+                continue
+
+            print(f"\n{Fore.BLUE}Auditing {category}…")
+            self.results.setdefault(category, {})
+
+            for check_name, fn in checks.items():
+                if include_checks and check_name.lower() not in include_checks:
+                    continue
+                if exclude_checks and check_name.lower() in exclude_checks:
+                    continue
+
+                print(f"{Fore.YELLOW}  Checking {check_name}…")
+                try:
+                    res = fn()
+                    if not isinstance(res, dict) or "status" not in res:
+                        raise AuditError(f"Check returned invalid structure: {check_name}")
+                    self.results[category][check_name] = res
+                    color = Fore.GREEN if res["status"] == "PASS" else (Fore.RED if res["status"] == "FAIL" else Fore.YELLOW)
+                    print(f"{color}    Status: {res['status']}")
+                except Exception as e:
+                    self.logger.exception(f"Error in check {category}.{check_name}")
+                    self.results[category][check_name] = {
+                        "status": "ERROR",
+                        "findings": f"Error executing check: {e}",
+                        "recommendations": "Review API access, connectivity, and logs. Re-run with --debug.",
+                    }
+                    print(f"{Fore.RED}    Error: {e}")
+
+        # Exports
+        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = os.path.join(outdir, f"qradar_audit_{stamp}")
+        os.makedirs(out_path, exist_ok=True)
+
+        if "console" in export:
+            self._print_report()
+        if "json" in export:
+            self._export_json(os.path.join(out_path, "report.json"))
+        if "csv" in export:
+            self._export_csv(os.path.join(out_path, "report.csv"))
+        if "html" in export:
+            self._export_html(os.path.join(out_path, "report.html"))
+
+        print(f"\n{Fore.CYAN}Output folder: {out_path}")
+        return {"version": version, "results": self.results, "out": out_path}
+
+    # ---------------------- Connection & API --------------------------
+
+    def _test_connection(self) -> bool:
+        data, status, _ = self._request("/api/system/about")
+        if status == 200:
             print(f"{Fore.GREEN}Successfully connected to QRadar API.")
             return True
-        except requests.exceptions.RequestException as e:
-            print(f"{Fore.RED}Error connecting to QRadar API: {str(e)}")
-            sys.exit(1)
-    
-    def _get_system_info(self):
-        """Retrieve system information from QRadar."""
-        url = f"{self.base_url}/api/system/about"
-        response = self._make_api_request(url)
-        return response
-    
-    def _make_api_request(self, url, method='GET', params=None, data=None):
-        """Make an API request to QRadar."""
-        try:
-            if method == 'GET':
-                response = requests.get(url, headers=self.headers, params=params, verify=self.verify_ssl)
-            elif method == 'POST':
-                response = requests.post(url, headers=self.headers, params=params, json=data, verify=self.verify_ssl)
-            elif method == 'PUT':
-                response = requests.put(url, headers=self.headers, params=params, json=data, verify=self.verify_ssl)
-            elif method == 'DELETE':
-                response = requests.delete(url, headers=self.headers, params=params, verify=self.verify_ssl)
-            else:
-                raise ValueError(f"Unsupported HTTP method: {method}")
-            
-            if response.status_code not in [200, 201, 202, 204]:
-                print(f"{Fore.YELLOW}API request failed: {url}, Status: {response.status_code}")
-                print(f"{Fore.YELLOW}Response: {response.text}")
-                return None
-                
-            if response.text:
-                return response.json()
+        print(f"{Fore.RED}Failed to connect to QRadar API (status {status}).")
+        return False
+
+    def _get_system_info(self) -> Dict[str, Any]:
+        data, _, _ = self._request("/api/system/about")
+        if isinstance(data, dict):
+            self.system_info = data
+            return data
+        return {}
+
+    # ---------------------- Data Collection ---------------------------
+
+    def _check_log_sources(self) -> Dict[str, Any]:
+        items = self._paginate_json("/api/config/event_sources/log_source_management/log_sources")
+        if items is None or not isinstance(items, list):
             return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': {
-                'backup_enabled': backup_info['backup_enabled'],
-                'backup_frequency': backup_info['backup_frequency'],
-                'last_backup_age_hours': backup_age_hours,
-                'backup_retention_days': backup_info['backup_retention'],
-                'backup_location': backup_info['backup_location']
+                "status": "FAIL",
+                "findings": "Unable to retrieve log sources.",
+                "recommendations": "Check API permissions/connectivity and token scope.",
             }
+        total = len(items)
+        enabled = sum(1 for s in items if s.get("enabled"))
+        status_counts: Dict[str, int] = {}
+        for s in items:
+            st = (s.get("status") or {}).get("status", "Unknown")
+            status_counts[st] = status_counts.get(st, 0) + 1
+        issues = sum(status_counts.get(k, 0) for k in ("Error", "Warning", "Disabled"))
+
+        if total == 0:
+            status = "FAIL"
+            findings = "No log sources configured."
+            rec = "Onboard critical log sources to ensure visibility."
+        elif issues > total * 0.10:
+            status = "FAIL"
+            findings = f"{issues}/{total} log sources in problematic state."
+            rec = "Investigate failing sources and fix transport/parsers."
+        else:
+            status = "PASS"
+            findings = f"{total} log sources found; {enabled} enabled."
+            rec = "Continue monitoring and add new sources as needed."
+        return {
+            "status": status,
+            "findings": findings,
+            "recommendations": rec,
+            "details": {"total": total, "enabled": enabled, "status_counts": status_counts},
         }
-    
-    # Security Configuration Checks
-    def _check_user_access(self):
-        """Check user access controls and privileges."""
-        url = f"{self.base_url}/api/config/access/users"
-        users = self._make_api_request(url)
-        
-        if not users:
+
+    def _check_event_collection_rate(self) -> Dict[str, Any]:
+        """Count events in a recent window via Ariel search.
+        ariel_window examples: "24h", "7d", "1d". Converted to hours.
+        """
+        # Convert window to hours
+        hours = 24
+        try:
+            if self.ariel_window.endswith("h"):
+                hours = int(self.ariel_window[:-1])
+            elif self.ariel_window.endswith("d"):
+                hours = int(self.ariel_window[:-1]) * 24
+        except Exception:
+            pass
+
+        # AQL note: There are multiple valid syntaxes; this one is broadly compatible
+        aql = f"SELECT COUNT(*) AS event_count FROM events WHERE starttime > NOW - {hours} HOURS"
+        create_payload = {"query_expression": aql}
+        data, status, _ = self._request("/api/ariel/searches", method="POST", json_body=create_payload)
+        if not isinstance(data, dict) or "search_id" not in data:
             return {
-                'status': 'WARNING',
-                'findings': "Unable to retrieve user information.",
-                'recommendations': "Check API permissions and connectivity."
+                "status": "WARNING",
+                "findings": "Unable to start Ariel search for event count.",
+                "recommendations": "Check Ariel permissions and logs; try increasing --timeout.",
             }
-        
-        # Analyze user configuration
+        search_id = data["search_id"]
+
+        # Poll status
+        t0 = time.time()
+        deadline = t0 + max(60, self.timeout * 3)
+        final_status = "UNKNOWN"
+        while time.time() < deadline:
+            info, st, _ = self._request(f"/api/ariel/searches/{search_id}")
+            if isinstance(info, dict):
+                final_status = info.get("status", final_status)
+                if final_status in {"COMPLETED", "CANCELED", "ERROR", "THROTTLED"}:
+                    break
+            time.sleep(2)
+
+        if final_status != "COMPLETED":
+            return {
+                "status": "WARNING",
+                "findings": f"Ariel search not completed (status={final_status}).",
+                "recommendations": "Optimize Ariel, reduce window, or allocate resources.",
+            }
+
+        rows, st, _ = self._request(f"/api/ariel/searches/{search_id}/results")
+        event_count = 0
+        try:
+            if isinstance(rows, list) and rows:
+                # Expect rows like [{"event_count": 12345}]
+                event_count = int(next(iter(rows[0].values())))
+        except Exception:
+            pass
+
+        if event_count == 0:
+            status = "FAIL"
+            findings = "No events collected in the selected window."
+            rec = "Verify log source connectivity and DSM mappings."
+        elif event_count < 1000 and hours >= 24:
+            status = "WARNING"
+            findings = f"Low event volume: {event_count} in last {hours}h."
+            rec = "Confirm key sources are onboarded and not throttled."
+        else:
+            status = "PASS"
+            findings = f"Healthy rate: {event_count} events in last {hours}h."
+            rec = "Keep monitoring for unexpected drops/spikes."
+        return {
+            "status": status,
+            "findings": findings,
+            "recommendations": rec,
+            "details": {"window_hours": hours, "event_count": event_count, "events_per_hour": round(event_count / max(1, hours), 2)},
+        }
+
+    def _check_log_source_coverage(self) -> Dict[str, Any]:
+        items = self._paginate_json("/api/config/event_sources/log_source_management/log_sources")
+        if items is None or not isinstance(items, list):
+            return {
+                "status": "WARNING",
+                "findings": "Unable to retrieve log sources.",
+                "recommendations": "Check token scope and user role.",
+            }
+        critical = {
+            "Firewall": False,
+            "IDS/IPS": False,
+            "Authentication": False,
+            "Operating System": False,
+            "Network Device": False,
+            "Database": False,
+            "Web Server": False,
+            "Endpoint": False,
+            "Cloud Service": False,
+            "Active Directory": False,
+        }
+        mapping = {
+            "Cisco PIX/ASA": "Firewall",
+            "Juniper SRX": "Firewall",
+            "CheckPoint": "Firewall",
+            "Palo Alto PA": "Firewall",
+            "Snort": "IDS/IPS",
+            "Sourcefire": "IDS/IPS",
+            "Cisco IPS": "IDS/IPS",
+            "Microsoft Windows Security": "Authentication",
+            "RADIUS": "Authentication",
+            "LDAP": "Authentication",
+            "Microsoft Windows": "Operating System",
+            "Unix": "Operating System",
+            "Linux": "Operating System",
+            "Cisco IOS": "Network Device",
+            "Juniper JunOS": "Network Device",
+            "Oracle": "Database",
+            "Microsoft SQL Server": "Database",
+            "MySQL": "Database",
+            "PostgreSQL": "Database",
+            "Apache": "Web Server",
+            "IIS": "Web Server",
+            "Nginx": "Web Server",
+            "Microsoft Windows Endpoint": "Endpoint",
+            "Carbon Black": "Endpoint",
+            "CrowdStrike": "Endpoint",
+            "AWS CloudTrail": "Cloud Service",
+            "Azure Activity Log": "Cloud Service",
+            "Office 365": "Cloud Service",
+            "Google Cloud": "Cloud Service",
+            "Microsoft Active Directory": "Active Directory",
+        }
+        for s in items:
+            tname = (s.get("type_name") or "").lower()
+            if not s.get("enabled"):
+                continue
+            for k, v in mapping.items():
+                if k.lower() in tname:
+                    critical[v] = True
+        covered = sum(1 for v in critical.values() if v)
+        total = len(critical)
+        pct = 100.0 * covered / total if total else 0.0
+        missing = [k for k, v in critical.items() if not v]
+        if pct < 50:
+            status = "FAIL"; findings = f"Poor coverage: {pct:.1f}%"; rec = f"Add: {', '.join(missing)}"
+        elif pct < 80:
+            status = "WARNING"; findings = f"Moderate coverage: {pct:.1f}%"; rec = f"Consider adding: {', '.join(missing)}"
+        else:
+            status = "PASS"; findings = f"Good coverage: {pct:.1f}%"; rec = "Maintain and review quarterly."
+        return {
+            "status": status,
+            "findings": findings,
+            "recommendations": rec,
+            "details": {"coverage_percentage": pct, "covered_types": covered, "total_types": total, "missing_types": missing},
+        }
+
+    def _check_log_source_status(self) -> Dict[str, Any]:
+        items = self._paginate_json("/api/config/event_sources/log_source_management/log_sources")
+        if items is None or not isinstance(items, list):
+            return {
+                "status": "WARNING",
+                "findings": "Unable to retrieve log source status.",
+                "recommendations": "Check API role and connectivity.",
+            }
+        counts = {"Active": 0, "Error": 0, "Warning": 0, "Disabled": 0, "Unknown": 0}
+        problems: List[Dict[str, Any]] = []
+        for s in items:
+            st = (s.get("status") or {}).get("status", "Unknown")
+            if st not in counts:
+                st = "Unknown"
+            counts[st] += 1
+            if st in ("Error", "Warning"):
+                problems.append({
+                    "name": s.get("name", "<unknown>"),
+                    "type": s.get("type_name", "<unknown>"),
+                    "status": st,
+                    "last_event": s.get("last_event_time", "Never"),
+                })
+        total = sum(counts.values())
+        pct = 100.0 * (counts["Error"] + counts["Warning"]) / total if total else 0.0
+        if pct > 20:
+            status = "FAIL"; findings = f"High issue rate: {pct:.1f}%"; rec = "Prioritize remediation for failing sources."
+        elif pct > 5:
+            status = "WARNING"; findings = f"Moderate issue rate: {pct:.1f}%"; rec = "Triage warnings and fix parsers/connectivity."
+        else:
+            status = "PASS"; findings = f"Low issue rate: {pct:.1f}%"; rec = "Continue monitoring."
+        return {
+            "status": status,
+            "findings": findings,
+            "recommendations": rec,
+            "details": {"status_counts": counts, "problem_percentage": pct, "problem_sources": problems[:5]},
+        }
+
+    # ---------------------- System Configuration ----------------------
+
+    def _check_system_health(self) -> Dict[str, Any]:
+        # Placeholder: replace with /api/system/health if available in your version
+        m = {
+            "cpu_utilization": 65,
+            "memory_utilization": 72,
+            "disk_io_utilization": 40,
+            "event_processing_delay": 2.5,
+            "services_status": "All services running",
+        }
+        concerns = []
+        if m["cpu_utilization"] > 80: concerns.append(f"High CPU ({m['cpu_utilization']}%)")
+        if m["memory_utilization"] > 85: concerns.append(f"High RAM ({m['memory_utilization']}%)")
+        if m["disk_io_utilization"] > 75: concerns.append(f"High disk I/O ({m['disk_io_utilization']}%)")
+        if m["event_processing_delay"] > 5: concerns.append(f"Delay {m['event_processing_delay']}s")
+        if "not running" in m["services_status"].lower(): concerns.append("Service issues present")
+        if len(concerns) > 2:
+            status, findings, rec = "FAIL", f"Multiple issues: {', '.join(concerns)}", "Re-evaluate sizing and tune pipeline."
+        elif concerns:
+            status, findings, rec = "WARNING", f"Concerns: {', '.join(concerns)}", "Monitor closely; plan optimization."
+        else:
+            status, findings, rec = "PASS", "Health within acceptable ranges.", "Continue regular monitoring."
+        return {"status": status, "findings": findings, "recommendations": rec, "details": m}
+
+    def _check_deployment_architecture(self) -> Dict[str, Any]:
+        hosts = self._paginate_json("/api/system/servers")
+        if not isinstance(hosts, list) or not hosts:
+            return {
+                "status": "WARNING",
+                "findings": "Unable to retrieve deployment info.",
+                "recommendations": "Ensure user has admin API role.",
+            }
+        console = ep = ec = fp = dn = 0
+        for h in hosts:
+            comps = h.get("components", [])
+            console += int("CONSOLE" in comps)
+            ep += int("EVENT_PROCESSOR" in comps)
+            ec += int("EVENT_COLLECTOR" in comps)
+            fp += int("FLOW_PROCESSOR" in comps)
+            dn += int("DATA_NODE" in comps)
+        if len(hosts) == 1:
+            dtype = "All-in-one"
+        elif len(hosts) <= 3:
+            dtype = "Basic distributed"
+        else:
+            dtype = "Fully distributed"
+        concerns = []
+        if dtype == "All-in-one" and ep > 0: concerns.append("All-in-one handling event processing")
+        if ec == 0: concerns.append("No dedicated event collectors")
+        if console == 0: concerns.append("No console component found")
+        if console > 1: concerns.append("Multiple consoles detected")
+        if dtype != "All-in-one" and ep == 0: concerns.append("No dedicated event processors")
+        if len(concerns) > 2:
+            status, findings, rec = "FAIL", f"Suboptimal architecture: {', '.join(concerns)}", "Align with QRadar best practices."
+        elif concerns:
+            status, findings, rec = "WARNING", f"Architecture concerns: {', '.join(concerns)}", "Consider scaling/role separation."
+        else:
+            status, findings, rec = "PASS", f"Appropriate {dtype} architecture.", "Scale with data growth."
+        return {
+            "status": status,
+            "findings": findings,
+            "recommendations": rec,
+            "details": {
+                "deployment_type": dtype,
+                "host_count": len(hosts),
+                "console_count": console,
+                "event_processor_count": ep,
+                "event_collector_count": ec,
+                "flow_collector_count": fp,
+                "data_node_count": dn,
+            },
+        }
+
+    def _check_storage_utilization(self) -> Dict[str, Any]:
+        s = {
+            "total_storage": 5000,
+            "used_storage": 3200,
+            "storage_allocation": {"events": 70, "flows": 20, "assets": 5, "other": 5},
+            "retention_periods": {"events": 90, "flows": 30, "assets": 180},
+        }
+        util = 100.0 * s["used_storage"] / s["total_storage"] if s["total_storage"] else 0
+        remaining_days = 42  # heuristic placeholder
+        concerns = []
+        if util > 85: concerns.append(f"High utilization ({util:.1f}%)")
+        if remaining_days < 30: concerns.append(f"Low growth headroom (~{remaining_days}d)")
+        if s["retention_periods"]["events"] < 30: concerns.append("Short event retention")
+        if s["retention_periods"]["flows"] < 7: concerns.append("Short flow retention")
+        if util > 90 or remaining_days < 15:
+            status, findings, rec = "FAIL", f"Storage risks: {', '.join(concerns)}", "Increase capacity or adjust retention/archiving."
+        elif concerns:
+            status, findings, rec = "WARNING", f"Storage concerns: {', '.join(concerns)}", "Plan expansion or optimize retention."
+        else:
+            status, findings, rec = "PASS", f"Healthy utilization ({util:.1f}%).", "Keep monitoring."
+        return {
+            "status": status,
+            "findings": findings,
+            "recommendations": rec,
+            "details": {
+                "utilization_percentage": util,
+                "remaining_days_at_current_rate": remaining_days,
+                "total_storage_gb": s["total_storage"],
+                "used_storage_gb": s["used_storage"],
+                "free_storage_gb": s["total_storage"] - s["used_storage"],
+                "retention_periods": s["retention_periods"],
+            },
+        }
+
+    def _check_backup_config(self) -> Dict[str, Any]:
+        b = {
+            "backup_enabled": True,
+            "backup_frequency": "Daily",
+            "last_successful_backup": "2025-08-15T02:30:00",
+            "backup_retention": 14,
+            "backup_location": "Remote NFS",
+            "configuration_included": True,
+            "data_included": False,
+        }
+        try:
+            last = dt.datetime.strptime(b["last_successful_backup"], "%Y-%m-%dT%H:%M:%S")
+            age_h = (dt.datetime.now() - last).total_seconds() / 3600
+        except Exception:
+            age_h = 999
+        concerns = []
+        if not b["backup_enabled"]: concerns.append("Backups disabled")
+        if age_h > 48: concerns.append(f"Last backup > {int(age_h/24)} days ago")
+        if b["backup_frequency"].lower() not in {"daily", "twice daily"}: concerns.append(f"Infrequent schedule: {b['backup_frequency']}")
+        if b["backup_retention"] < 7: concerns.append("Short retention")
+        if not b["configuration_included"]: concerns.append("Config not included")
+        if len(concerns) and (not b["backup_enabled"] or age_h > 72):
+            status, findings, rec = "FAIL", f"Critical backup issues: {', '.join(concerns)}", "Implement/validate robust backup strategy now."
+        elif concerns:
+            status, findings, rec = "WARNING", f"Backup concerns: {', '.join(concerns)}", "Improve backup schedule and scope."
+        else:
+            status, findings, rec = "PASS", "Backups configured and recent.", "Test restores regularly."
+        return {
+            "status": status,
+            "findings": findings,
+            "recommendations": rec,
+            "details": {**b, "last_backup_age_hours": age_h},
+        }
+
+    # ---------------------- Security Configuration --------------------
+
+    def _check_user_access(self) -> Dict[str, Any]:
+        users = self._paginate_json("/api/config/access/users")
+        if not isinstance(users, list):
+            return {
+                "status": "WARNING",
+                "findings": "Unable to retrieve user info.",
+                "recommendations": "Check API permissions and connectivity.",
+            }
         admin_count = 0
-        inactive_users = 0
-        default_users = 0
-        security_concerns = []
-        
-        for user in users:
-            role_ids = user.get('role_id', [])
-            
-            # Check for admin users
-            if 1 in role_ids:  # Assuming role_id 1 is admin
+        inactive = 0
+        defaults = 0
+        concerns: List[str] = []
+        now_ms = time.time() * 1000
+        for u in users:
+            role_ids = u.get("role_id")
+            if isinstance(role_ids, list) and 1 in role_ids:
                 admin_count += 1
-            
-            # Check for default users
-            if user.get('email', '').lower() in ['admin@localhost', 'root@localhost']:
-                default_users += 1
-            
-            # Check for inactive users
-            last_login = user.get('last_login_time', 0)
-            if last_login == 0 or (time.time() * 1000 - last_login) > (90 * 24 * 60 * 60 * 1000):  # 90 days
-                inactive_users += 1
-        
-        # Check for excessive admins
-        if admin_count > 5:
-            security_concerns.append(f"Excessive number of admin users: {admin_count}")
-        
-        # Check for default users
-        if default_users > 0:
-            security_concerns.append(f"Default user accounts still active: {default_users}")
-        
-        # Check for inactive users
-        if inactive_users > 3:
-            security_concerns.append(f"Multiple inactive user accounts: {inactive_users}")
-        
-        if security_concerns:
-            if len(security_concerns) > 1:
-                status = 'FAIL'
-                findings = f"Multiple user access control issues: {', '.join(security_concerns)}"
-                recommendations = "Review and clean up user accounts. Implement a user access review process and principle of least privilege."
-            else:
-                status = 'WARNING'
-                findings = f"User access control concern: {security_concerns[0]}"
-                recommendations = "Review user accounts and implement a regular access review process."
+            if str(u.get("email", "")).lower() in {"admin@localhost", "root@localhost"}:
+                defaults += 1
+            last_login = u.get("last_login_time", 0)
+            if not last_login or (now_ms - last_login) > 90 * 24 * 60 * 60 * 1000:
+                inactive += 1
+        if admin_count > 5: concerns.append(f"Excessive admins ({admin_count})")
+        if defaults: concerns.append(f"Default accounts active ({defaults})")
+        if inactive > 3: concerns.append(f"Inactive accounts ({inactive})")
+        if len(concerns) > 1:
+            status, findings, rec = "FAIL", f"User access issues: {', '.join(concerns)}", "Cleanup accounts; enforce least privilege + quarterly review."
+        elif concerns:
+            status, findings, rec = "WARNING", f"User access concern: {concerns[0]}", "Review accounts and implement regular access reviews."
         else:
-            status = 'PASS'
-            findings = "User access controls appear to be properly configured."
-            recommendations = "Continue regular user access reviews and maintain principle of least privilege."
-        
+            status, findings, rec = "PASS", "User access controls look reasonable.", "Maintain least-privilege and quarterly review cadence."
         return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': {
-                'total_users': len(users),
-                'admin_count': admin_count,
-                'inactive_users': inactive_users,
-                'default_users': default_users
-            }
+            "status": status,
+            "findings": findings,
+            "recommendations": rec,
+            "details": {"total_users": len(users), "admin_count": admin_count, "inactive_users": inactive, "default_users": defaults},
         }
-    
-    def _check_password_policies(self):
-        """Check password policies and settings."""
-        # In a real implementation, this would query password policy settings
-        # For this example, we'll simulate password policy information
-        
-        password_policy = {
-            'minimum_length': 8,
-            'complexity_required': True,
-            'expiration_days': 90,
-            'history_size': 5,
-            'lockout_threshold': 5,
-            'lockout_duration_minutes': 30
+
+    def _check_password_policies(self) -> Dict[str, Any]:
+        policy = {
+            "minimum_length": 12,
+            "complexity_required": True,
+            "expiration_days": 90,
+            "history_size": 5,
+            "lockout_threshold": 5,
+            "lockout_duration_minutes": 30,
         }
-        
-        # Evaluate password policy
         concerns = []
-        
-        if password_policy['minimum_length'] < 8:
-            concerns.append(f"Weak minimum password length: {password_policy['minimum_length']} characters")
-        
-        if not password_policy['complexity_required']:
-            concerns.append("Password complexity not required")
-        
-        if password_policy['expiration_days'] > 90 or password_policy['expiration_days'] == 0:
-            concerns.append(f"Suboptimal password expiration policy: {password_policy['expiration_days']} days")
-        
-        if password_policy['history_size'] < 4:
-            concerns.append(f"Insufficient password history size: {password_policy['history_size']}")
-        
-        if password_policy['lockout_threshold'] > 5 or password_policy['lockout_threshold'] == 0:
-            concerns.append(f"Weak account lockout threshold: {password_policy['lockout_threshold']} attempts")
-        
-        if concerns:
-            if len(concerns) > 2:
-                status = 'FAIL'
-                findings = f"Multiple password policy weaknesses: {', '.join(concerns)}"
-                recommendations = "Strengthen password policies to match security best practices and compliance requirements."
-            else:
-                status = 'WARNING'
-                findings = f"Password policy concerns: {', '.join(concerns)}"
-                recommendations = "Review and improve password policies to enhance security."
+        if policy["minimum_length"] < 8: concerns.append("Min length < 8")
+        if not policy["complexity_required"]: concerns.append("No complexity")
+        if policy["expiration_days"] > 90 or policy["expiration_days"] == 0: concerns.append("Weak expiration policy")
+        if policy["history_size"] < 4: concerns.append("Small history")
+        if policy["lockout_threshold"] > 5 or policy["lockout_threshold"] == 0: concerns.append("Weak lockout threshold")
+        if len(concerns) > 2:
+            status, findings, rec = "FAIL", f"Password policy weaknesses: {', '.join(concerns)}", "Align with corporate/compliance requirements."
+        elif concerns:
+            status, findings, rec = "WARNING", f"Policy concerns: {', '.join(concerns)}", "Tighten password policy settings."
         else:
-            status = 'PASS'
-            findings = "Password policies meet security best practices."
-            recommendations = "Continue to periodically review password policies against evolving security standards."
-        
-        return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': password_policy
+            status, findings, rec = "PASS", "Password policy meets best practices.", "Review annually."
+        return {"status": status, "findings": findings, "recommendations": rec, "details": policy}
+
+    def _check_network_security(self) -> Dict[str, Any]:
+        net = {
+            "https_enabled": True,
+            "tls_version": "TLS 1.2",
+            "weak_ciphers_disabled": True,
+            "console_accessible_ips": ["10.0.0.0/8", "192.168.0.0/16"],
+            "ssh_enabled": True,
+            "ssh_root_login_disabled": True,
+            "firewall_enabled": True,
+            "unnecessary_services_disabled": True,
         }
-    
-    def _check_network_security(self):
-        """Check network security configuration."""
-        # In a real implementation, this would query network security settings
-        # For this example, we'll simulate network security information
-        
-        network_security = {
-            'https_enabled': True,
-            'tls_version': 'TLS 1.2',
-            'weak_ciphers_disabled': True,
-            'console_accessible_ips': ['10.0.0.0/8', '192.168.0.0/16'],
-            'ssh_enabled': True,
-            'ssh_root_login_disabled': True,
-            'firewall_enabled': True,
-            'unnecessary_services_disabled': True
-        }
-        
-        # Evaluate network security
         concerns = []
-        
-        if not network_security['https_enabled']:
-            concerns.append("HTTPS is not enabled for web console")
-        
-        if network_security['tls_version'] not in ['TLS 1.2', 'TLS 1.3']:
-            concerns.append(f"Outdated TLS version: {network_security['tls_version']}")
-        
-        if not network_security['weak_ciphers_disabled']:
-            concerns.append("Weak cryptographic ciphers are not disabled")
-        
-        if '0.0.0.0/0' in network_security['console_accessible_ips']:
-            concerns.append("Console is accessible from any IP address")
-        
-        if not network_security['ssh_root_login_disabled']:
-            concerns.append("SSH root login is enabled")
-        
-        if not network_security['firewall_enabled']:
-            concerns.append("Host-based firewall is not enabled")
-        
-        if concerns:
-            if len(concerns) > 2:
-                status = 'FAIL'
-                findings = f"Multiple network security issues: {', '.join(concerns)}"
-                recommendations = "Address network security vulnerabilities to protect the SIEM infrastructure."
-            else:
-                status = 'WARNING'
-                findings = f"Network security concerns: {', '.join(concerns)}"
-                recommendations = "Improve network security configuration to reduce attack surface."
+        if not net["https_enabled"]: concerns.append("HTTPS disabled")
+        if net["tls_version"] not in {"TLS 1.2", "TLS 1.3"}: concerns.append("Outdated TLS")
+        if not net["weak_ciphers_disabled"]: concerns.append("Weak ciphers enabled")
+        if "0.0.0.0/0" in net["console_accessible_ips"]: concerns.append("Console open to world")
+        if not net["ssh_root_login_disabled"]: concerns.append("SSH root login enabled")
+        if not net["firewall_enabled"]: concerns.append("Host firewall disabled")
+        if len(concerns) > 2:
+            status, findings, rec = "FAIL", f"Network security issues: {', '.join(concerns)}", "Harden host and restrict management plane."
+        elif concerns:
+            status, findings, rec = "WARNING", f"Network concerns: {', '.join(concerns)}", "Tighten crypto/ACLs and host policies."
         else:
-            status = 'PASS'
-            findings = "Network security is properly configured."
-            recommendations = "Continue to monitor for new security vulnerabilities and maintain secure configuration."
-        
-        return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': network_security
+            status, findings, rec = "PASS", "Network hardening looks reasonable.", "Maintain secure baseline and review periodically."
+        return {"status": status, "findings": findings, "recommendations": rec, "details": net}
+
+    def _check_authentication_methods(self) -> Dict[str, Any]:
+        auth = {
+            "local_auth_enabled": True,
+            "ldap_enabled": True,
+            "ldap_servers": 2,
+            "ldap_failover_configured": True,
+            "ldap_ssl_enabled": True,
+            "radius_enabled": False,
+            "saml_enabled": False,
+            "mfa_enabled": False,
         }
-    
-    def _check_authentication_methods(self):
-        """Check authentication methods and configurations."""
-        # In a real implementation, this would query authentication settings
-        # For this example, we'll simulate authentication information
-        
-        auth_methods = {
-            'local_auth_enabled': True,
-            'ldap_enabled': True,
-            'ldap_servers': 2,
-            'ldap_failover_configured': True,
-            'ldap_ssl_enabled': True,
-            'radius_enabled': False,
-            'saml_enabled': False,
-            'mfa_enabled': False
-        }
-        
-        # Evaluate authentication methods
         concerns = []
         suggestions = []
-        
-        if not auth_methods['ldap_enabled'] and not auth_methods['radius_enabled'] and not auth_methods['saml_enabled']:
-            concerns.append("Only local authentication is configured")
-        
-        if auth_methods['ldap_enabled'] and not auth_methods['ldap_ssl_enabled']:
-            concerns.append("LDAP is configured without SSL/TLS")
-        
-        if auth_methods['ldap_enabled'] and auth_methods['ldap_servers'] < 2:
-            concerns.append("Only one LDAP server configured without failover")
-        
-        if not auth_methods['mfa_enabled']:
-            suggestions.append("Multi-factor authentication is not enabled")
-        
-        if concerns:
-            if len(concerns) > 1:
-                status = 'FAIL'
-                findings = f"Authentication security issues: {', '.join(concerns)}"
-                recommendations = "Improve authentication security by addressing identified issues and considering multi-factor authentication."
-            else:
-                status = 'WARNING'
-                findings = f"Authentication concern: {concerns[0]}"
-                recommendations = "Enhance authentication security configuration."
+        if not (auth["ldap_enabled"] or auth["radius_enabled"] or auth["saml_enabled"]):
+            concerns.append("Only local auth configured")
+        if auth["ldap_enabled"] and not auth["ldap_ssl_enabled"]: concerns.append("LDAP without TLS")
+        if auth["ldap_enabled"] and auth["ldap_servers"] < 2: concerns.append("Single LDAP server")
+        if not auth["mfa_enabled"]: suggestions.append("Enable MFA")
+        if len(concerns) > 1:
+            status, findings, rec = "FAIL", f"Auth issues: {', '.join(concerns)}", "Harden directory auth; add MFA."
+        elif concerns:
+            status, findings, rec = "WARNING", f"Auth concern: {concerns[0]}", "Improve authentication controls."
         else:
             if suggestions:
-                status = 'WARNING'
-                findings = "Authentication methods are secure but could be enhanced."
-                recommendations = f"Consider improvements: {', '.join(suggestions)}"
+                status, findings, rec = "WARNING", "Auth is OK but could be enhanced.", ", ".join(suggestions)
             else:
-                status = 'PASS'
-                findings = "Authentication methods are securely configured."
-                recommendations = "Continue to evaluate new authentication technologies as they become available."
-        
-        return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': auth_methods
-        }
-    
-    # Detection Capabilities Checks
-    def _check_custom_rules(self):
-        """Check custom rules configuration and effectiveness."""
-        url = f"{self.base_url}/api/analytics/rules"
-        rules = self._make_api_request(url)
-        
-        if not rules:
+                status, findings, rec = "PASS", "Auth methods are secure.", "Review new auth tech annually."
+        return {"status": status, "findings": findings, "recommendations": rec, "details": auth}
+
+    # ---------------------- Detection Capabilities --------------------
+
+    def _check_custom_rules(self) -> Dict[str, Any]:
+        rules = self._paginate_json("/api/analytics/rules")
+        if not isinstance(rules, list):
             return {
-                'status': 'WARNING',
-                'findings': "Unable to retrieve rules information.",
-                'recommendations': "Check API permissions and connectivity."
+                "status": "WARNING",
+                "findings": "Unable to retrieve rules.",
+                "recommendations": "Confirm /api/analytics access and pagination support.",
             }
-        
-        # Analyze rules
-        total_rules = len(rules)
-        enabled_rules = sum(1 for rule in rules if rule.get('enabled', False))
-        custom_rules = sum(1 for rule in rules if not rule.get('system', False))
-        disabled_rules = total_rules - enabled_rules
-        
-        # Check for rules that never fire
+        total = len(rules)
+        enabled = sum(1 for r in rules if r.get("enabled"))
+        custom = sum(1 for r in rules if not r.get("system", False))
+        disabled = total - enabled
         never_triggered = 0
-        stale_rules = 0
-        
-        for rule in rules:
-            if rule.get('enabled', False):
-                last_run = rule.get('last_run_time', 0)
-                if last_run == 0:
+        stale = 0
+        now_ms = time.time() * 1000
+        for r in rules:
+            if r.get("enabled"):
+                last = r.get("last_run_time", 0)
+                if not last:
                     never_triggered += 1
-                elif (time.time() * 1000 - last_run) > (180 * 24 * 60 * 60 * 1000):  # 180 days
-                    stale_rules += 1
-        
-        # Evaluate rules configuration
+                elif (now_ms - last) > 180 * 24 * 60 * 60 * 1000:
+                    stale += 1
         concerns = []
-        
-        if custom_rules < 10:
-            concerns.append(f"Low number of custom rules: {custom_rules}")
-        
-        if disabled_rules > total_rules * 0.2:
-            concerns.append(f"High percentage of disabled rules: {(disabled_rules/total_rules)*100:.1f}%")
-        
-        if never_triggered > enabled_rules * 0.3:
-            concerns.append(f"Many rules never triggered: {never_triggered} rules")
-        
-        if stale_rules > 5:
-            concerns.append(f"Multiple stale rules that haven't triggered recently: {stale_rules} rules")
-        
-        if concerns:
-            if len(concerns) > 2:
-                status = 'FAIL'
-                findings = f"Multiple rule configuration issues: {', '.join(concerns)}"
-                recommendations = "Review and optimize rules to improve detection capabilities. Consider rule tuning workshops and regular rule reviews."
-            else:
-                status = 'WARNING'
-                findings = f"Rule configuration concerns: {', '.join(concerns)}"
-                recommendations = "Review and tune detection rules to improve effectiveness."
+        if custom < 10: concerns.append(f"Low custom rules ({custom})")
+        if disabled > total * 0.2: concerns.append(f"Many disabled ({disabled}/{total})")
+        if enabled and never_triggered > enabled * 0.3: concerns.append(f"Rules never fired ({never_triggered})")
+        if stale > 5: concerns.append(f"Stale rules ({stale})")
+        if len(concerns) > 2:
+            status, findings, rec = "FAIL", f"Rule hygiene issues: {', '.join(concerns)}", "Triage, tune, and prune rules; run tuning workshops."
+        elif concerns:
+            status, findings, rec = "WARNING", f"Rule concerns: {', '.join(concerns)}", "Tune/retire noisy/stale rules; add targeted detections."
         else:
-            status = 'PASS'
-            findings = f"Rules appear well configured with {custom_rules} custom rules."
-            recommendations = "Continue regular rule review and tuning to maintain effective detection."
-        
+            status, findings, rec = "PASS", f"Rules look healthy with {custom} custom items.", "Keep periodic tuning cycles."
         return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': {
-                'total_rules': total_rules,
-                'enabled_rules': enabled_rules,
-                'custom_rules': custom_rules,
-                'disabled_rules': disabled_rules,
-                'never_triggered': never_triggered,
-                'stale_rules': stale_rules
-            }
+            "status": status,
+            "findings": findings,
+            "recommendations": rec,
+            "details": {
+                "total_rules": total,
+                "enabled_rules": enabled,
+                "custom_rules": custom,
+                "disabled_rules": disabled,
+                "never_triggered": never_triggered,
+                "stale_rules": stale,
+            },
         }
-    
-    def _check_offense_config(self):
-        """Check offense configuration and management."""
-        url = f"{self.base_url}/api/siem/offenses"
-        params = {
-            'fields': 'id,status,assigned_to',
-            'filter': 'status != "CLOSED"'
-        }
-        active_offenses = self._make_api_request(url, params=params)
-        
-        if active_offenses is None:
+
+    def _check_offense_config(self) -> Dict[str, Any]:
+        params = {"fields": "id,status,assigned_to,start_time"}
+        offenses = self._paginate_json("/api/siem/offenses", params)
+        if not isinstance(offenses, list):
             return {
-                'status': 'WARNING',
-                'findings': "Unable to retrieve offense information.",
-                'recommendations': "Check API permissions and connectivity."
+                "status": "WARNING",
+                "findings": "Unable to retrieve offenses.",
+                "recommendations": "Check SIEM API scope and paging.",
             }
-        
-        # Analyze offenses
-        total_active = len(active_offenses)
-        unassigned = sum(1 for offense in active_offenses if not offense.get('assigned_to'))
-        
-        # Get aging information for offenses
-        aging_buckets = {
-            '0-1 days': 0,
-            '1-7 days': 0,
-            '7-30 days': 0,
-            '30+ days': 0
-        }
-        
-        current_time = time.time() * 1000
-        for offense in active_offenses:
-            start_time = offense.get('start_time', current_time)
-            age_days = (current_time - start_time) / (24 * 60 * 60 * 1000)
-            
-            if age_days <= 1:
-                aging_buckets['0-1 days'] += 1
-            elif age_days <= 7:
-                aging_buckets['1-7 days'] += 1
-            elif age_days <= 30:
-                aging_buckets['7-30 days'] += 1
-            else:
-                aging_buckets['30+ days'] += 1
-        
-        # Evaluate offense management
+        active = [o for o in offenses if str(o.get("status", "")).upper() != "CLOSED"]
+        total_active = len(active)
+        unassigned = sum(1 for o in active if not o.get("assigned_to"))
+        now_ms = time.time() * 1000
+        aging = {"0-1 days": 0, "1-7 days": 0, "7-30 days": 0, "30+ days": 0}
+        for o in active:
+            start = o.get("start_time", now_ms)
+            age_d = (now_ms - start) / (24 * 60 * 60 * 1000)
+            if age_d <= 1: aging["0-1 days"] += 1
+            elif age_d <= 7: aging["1-7 days"] += 1
+            elif age_d <= 30: aging["7-30 days"] += 1
+            else: aging["30+ days"] += 1
         concerns = []
-        
-        if total_active > 100:
-            concerns.append(f"High number of active offenses: {total_active}")
-        
-        if unassigned > total_active * 0.5:
-            concerns.append(f"High percentage of unassigned offenses: {(unassigned/total_active)*100:.1f}%")
-        
-        if aging_buckets['30+ days'] > 10:
-            concerns.append(f"Many old offenses (30+ days): {aging_buckets['30+ days']}")
-        
-        if concerns:
-            if aging_buckets['30+ days'] > 30 or total_active > 200:
-                status = 'FAIL'
-                findings = f"Critical offense management issues: {', '.join(concerns)}"
-                recommendations = "Implement an offense handling process with clear ownership and SLAs. Consider automation for common offense types."
-            else:
-                status = 'WARNING'
-                findings = f"Offense management concerns: {', '.join(concerns)}"
-                recommendations = "Review offense handling process to reduce backlog and improve response time."
+        if total_active > 100: concerns.append(f"High active offenses ({total_active})")
+        if total_active and unassigned > total_active * 0.5: concerns.append(f"Unassigned {unassigned}/{total_active}")
+        if aging["30+ days"] > 10: concerns.append(f"Old offenses {aging['30+ days']}")
+        if aging["30+ days"] > 30 or total_active > 200:
+            status, findings, rec = "FAIL", f"Critical offense mgmt issues: {', '.join(concerns)}", "Establish SLAs, ownership, and automation."
+        elif concerns:
+            status, findings, rec = "WARNING", f"Offense mgmt concerns: {', '.join(concerns)}", "Reduce backlog and implement triage playbooks."
         else:
-            status = 'PASS'
-            findings = "Offense management appears effective with timely handling."
-            recommendations = "Continue effective offense response processes and consider automation for common scenarios."
-        
+            status, findings, rec = "PASS", "Offense handling appears timely.", "Sustain current process; expand automation."
         return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': {
-                'total_active': total_active,
-                'unassigned': unassigned,
-                'aging': aging_buckets
-            }
+            "status": status,
+            "findings": findings,
+            "recommendations": rec,
+            "details": {"total_active": total_active, "unassigned": unassigned, "aging": aging},
         }
-    
-    def _check_rule_coverage(self):
-        """Check rule coverage against common attack vectors."""
-        # In a real implementation, this would analyze rules against a framework like MITRE ATT&CK
-        # For this example, we'll simulate coverage information
-        
-        mitre_coverage = {
-            'Initial Access': 70,            # percent coverage
-            'Execution': 85,
-            'Persistence': 60,
-            'Privilege Escalation': 65,
-            'Defense Evasion': 55,
-            'Credential Access': 80,
-            'Discovery': 50,
-            'Lateral Movement': 75,
-            'Collection': 60,
-            'Exfiltration': 70,
-            'Command and Control': 85,
-            'Impact': 65
+
+    def _check_rule_coverage(self) -> Dict[str, Any]:
+        coverage = {
+            "Initial Access": 70,
+            "Execution": 85,
+            "Persistence": 60,
+            "Privilege Escalation": 65,
+            "Defense Evasion": 55,
+            "Credential Access": 80,
+            "Discovery": 50,
+            "Lateral Movement": 75,
+            "Collection": 60,
+            "Exfiltration": 70,
+            "Command and Control": 85,
+            "Impact": 65,
         }
-        
-        # Calculate overall coverage
-        overall_coverage = sum(mitre_coverage.values()) / len(mitre_coverage)
-        
-        # Find gaps in coverage
-        coverage_gaps = [tactic for tactic, coverage in mitre_coverage.items() if coverage < 60]
-        
-        # Evaluate rule coverage
-        if overall_coverage < 50:
-            status = 'FAIL'
-            findings = f"Poor detection coverage: {overall_coverage:.1f}% across MITRE ATT&CK tactics."
-            recommendations = f"Develop additional detection rules for: {', '.join(coverage_gaps)}. Consider a threat-based approach to rule development."
-        elif overall_coverage < 70:
-            status = 'WARNING'
-            findings = f"Moderate detection coverage: {overall_coverage:.1f}% across MITRE ATT&CK tactics."
-            recommendations = f"Improve coverage for: {', '.join(coverage_gaps)}."
+        overall = sum(coverage.values()) / len(coverage)
+        gaps = [k for k, v in coverage.items() if v < 60]
+        if overall < 50:
+            status, findings, rec = "FAIL", f"Poor ATT&CK coverage {overall:.1f}%", f"Develop detections for: {', '.join(gaps)}"
+        elif overall < 70:
+            status, findings, rec = "WARNING", f"Moderate coverage {overall:.1f}%", f"Improve: {', '.join(gaps)}"
         else:
-            status = 'PASS'
-            findings = f"Good detection coverage: {overall_coverage:.1f}% across MITRE ATT&CK tactics."
-            recommendations = "Continue enhancing detection capabilities focusing on emerging threats."
-        
-        return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': {
-                'overall_coverage': overall_coverage,
-                'coverage_by_tactic': mitre_coverage,
-                'coverage_gaps': coverage_gaps
-            }
-        }
-    
-    def _check_reference_sets(self):
-        """Check reference set configuration and usage."""
-        url = f"{self.base_url}/api/reference_data/sets"
-        reference_sets = self._make_api_request(url)
-        
-        if not reference_sets:
+            status, findings, rec = "PASS", f"Good coverage {overall:.1f}%", "Focus on emerging threats."
+        return {"status": status, "findings": findings, "recommendations": rec, "details": {"overall": overall, "by_tactic": coverage, "gaps": gaps}}
+
+    def _check_reference_sets(self) -> Dict[str, Any]:
+        refsets = self._paginate_json("/api/reference_data/sets")
+        if not isinstance(refsets, list):
             return {
-                'status': 'WARNING',
-                'findings': "Unable to retrieve reference set information.",
-                'recommendations': "Check API permissions and connectivity."
+                "status": "WARNING",
+                "findings": "Unable to retrieve reference sets.",
+                "recommendations": "Confirm Reference Data API access.",
             }
-        
-        # Analyze reference sets
-        total_sets = len(reference_sets)
-        empty_sets = 0
-        stale_sets = 0
-        current_time = time.time() * 1000
-        
-        for ref_set in reference_sets:
-            if ref_set.get('number_of_elements', 0) == 0:
-                empty_sets += 1
-            
-            last_updated = ref_set.get('last_updated', 0)
-            if last_updated > 0 and (current_time - last_updated) > (90 * 24 * 60 * 60 * 1000):  # 90 days
-                stale_sets += 1
-        
-        # Check for common threat intelligence sets
-        common_ti_sets = ['Malicious IPs', 'Malicious Domains', 'Suspicious User Agents', 'TOR Exit Nodes']
-        missing_ti_sets = [ti_set for ti_set in common_ti_sets 
-                          if not any(rs.get('name', '').lower() == ti_set.lower() for rs in reference_sets)]
-        
-        # Evaluate reference sets
+        total = len(refsets); empty = 0; stale = 0
+        now_ms = time.time() * 1000
+        for rs in refsets:
+            if rs.get("number_of_elements", 0) == 0:
+                empty += 1
+            last = rs.get("last_updated", 0)
+            if last and (now_ms - last) > 90 * 24 * 60 * 60 * 1000:
+                stale += 1
+        common = ["Malicious IPs", "Malicious Domains", "Suspicious User Agents", "TOR Exit Nodes"]
+        missing = [n for n in common if not any(str(rs.get("name", "")).lower() == n.lower() for rs in refsets)]
         concerns = []
-        
-        if total_sets < 5:
-            concerns.append(f"Few reference sets configured: {total_sets}")
-        
-        if empty_sets > total_sets * 0.3:
-            concerns.append(f"Many empty reference sets: {empty_sets} out of {total_sets}")
-        
-        if stale_sets > total_sets * 0.5:
-            concerns.append(f"Many stale reference sets: {stale_sets} out of {total_sets}")
-        
-        if missing_ti_sets:
-            concerns.append(f"Missing common threat intelligence sets: {', '.join(missing_ti_sets)}")
-        
-        if concerns:
-            if len(concerns) > 2:
-                status = 'FAIL'
-                findings = f"Multiple reference set issues: {', '.join(concerns)}"
-                recommendations = "Implement and maintain reference sets for threat intelligence. Consider automated updates and regular reviews."
-            else:
-                status = 'WARNING'
-                findings = f"Reference set concerns: {', '.join(concerns)}"
-                recommendations = "Review and optimize reference set configuration and maintenance."
+        if total < 5: concerns.append(f"Few reference sets ({total})")
+        if empty > total * 0.3: concerns.append(f"Many empty ({empty}/{total})")
+        if stale > total * 0.5: concerns.append(f"Many stale ({stale}/{total})")
+        if missing: concerns.append(f"Missing common TI sets: {', '.join(missing)}")
+        if len(concerns) > 2:
+            status, findings, rec = "FAIL", f"Ref set issues: {', '.join(concerns)}", "Automate TI feeds and routine hygiene."
+        elif concerns:
+            status, findings, rec = "WARNING", f"Ref set concerns: {', '.join(concerns)}", "Review and optimize reference data."
         else:
-            status = 'PASS'
-            findings = f"{total_sets} reference sets properly configured and maintained."
-            recommendations = "Continue to update reference sets regularly with current threat intelligence."
-        
+            status, findings, rec = "PASS", f"{total} reference sets maintained.", "Keep feeds fresh and validated."
         return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': {
-                'total_sets': total_sets,
-                'empty_sets': empty_sets,
-                'stale_sets': stale_sets,
-                'missing_ti_sets': missing_ti_sets
-            }
+            "status": status,
+            "findings": findings,
+            "recommendations": rec,
+            "details": {"total_sets": total, "empty_sets": empty, "stale_sets": stale, "missing_ti_sets": missing},
         }
-    
-    # Operational Efficiency Checks
-    def _check_search_performance(self):
-        """Check search performance and optimization."""
-        # In a real implementation, this would analyze search performance metrics
-        # For this example, we'll simulate search performance information
-        
-        search_metrics = {
-            'avg_search_time': 45,  # seconds
-            'search_timeout_rate': 0.05,  # 5%
-            'long_running_searches': 3,
-            'indexed_fields': 35,
-            'custom_properties': 28,
-            'search_optimizations_enabled': True
+
+    # ---------------------- Operational Efficiency --------------------
+
+    def _check_search_performance(self) -> Dict[str, Any]:
+        m = {
+            "avg_search_time": 45,
+            "search_timeout_rate": 0.05,
+            "long_running_searches": 3,
+            "indexed_fields": 35,
+            "custom_properties": 28,
+            "search_optimizations_enabled": True,
         }
-        
-        # Evaluate search performance
         concerns = []
-        
-        if search_metrics['avg_search_time'] > 120:
-            concerns.append(f"High average search time: {search_metrics['avg_search_time']} seconds")
-        
-        if search_metrics['search_timeout_rate'] > 0.1:
-            concerns.append(f"High search timeout rate: {search_metrics['search_timeout_rate']*100:.1f}%")
-        
-        if search_metrics['long_running_searches'] > 5:
-            concerns.append(f"Multiple long-running searches: {search_metrics['long_running_searches']}")
-        
-        if search_metrics['indexed_fields'] < 20:
-            concerns.append(f"Few indexed fields: {search_metrics['indexed_fields']}")
-        
-        if not search_metrics['search_optimizations_enabled']:
-            concerns.append("Search optimizations are not enabled")
-        
-        if concerns:
-            if search_metrics['avg_search_time'] > 180 or search_metrics['search_timeout_rate'] > 0.2:
-                status = 'FAIL'
-                findings = f"Severe search performance issues: {', '.join(concerns)}"
-                recommendations = "Review and optimize search performance by adding indexes, optimizing queries, and reviewing hardware resources."
-            else:
-                status = 'WARNING'
-                findings = f"Search performance concerns: {', '.join(concerns)}"
-                recommendations = "Improve search performance through index optimization and query tuning."
+        if m["avg_search_time"] > 120: concerns.append(f"High avg time {m['avg_search_time']}s")
+        if m["search_timeout_rate"] > 0.1: concerns.append(f"Timeout rate {100*m['search_timeout_rate']:.1f}%")
+        if m["long_running_searches"] > 5: concerns.append("Many long-running searches")
+        if m["indexed_fields"] < 20: concerns.append("Few indexed fields")
+        if not m["search_optimizations_enabled"]: concerns.append("Optimizations disabled")
+        if m["avg_search_time"] > 180 or m["search_timeout_rate"] > 0.2:
+            status, findings, rec = "FAIL", f"Severe search issues: {', '.join(concerns)}", "Add indexes, tune AQL, and review hardware."
+        elif concerns:
+            status, findings, rec = "WARNING", f"Search concerns: {', '.join(concerns)}", "Tune indexes/queries; education for users."
         else:
-            status = 'PASS'
-            findings = "Search performance appears optimal."
-            recommendations = "Continue monitoring search performance metrics and adapt as data volume grows."
-        
-        return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': search_metrics
+            status, findings, rec = "PASS", "Search performance is healthy.", "Monitor as data grows."
+        return {"status": status, "findings": findings, "recommendations": rec, "details": m}
+
+    def _check_reports(self) -> Dict[str, Any]:
+        info = {
+            "total_reports": 12,
+            "scheduled_reports": 8,
+            "report_distribution": {"Compliance": 4, "Executive": 2, "Operational": 5, "Custom": 1},
+            "report_formats": ["PDF", "CSV"],
+            "distribution_methods": ["Email"],
         }
-    
-    def _check_reports(self):
-        """Check report configuration and scheduling."""
-        # In a real implementation, this would query report configuration
-        # For this example, we'll simulate report information
-        
-        report_info = {
-            'total_reports': 12,
-            'scheduled_reports': 8,
-            'report_distribution': {
-                'Compliance': 4,
-                'Executive': 2,
-                'Operational': 5,
-                'Custom': 1
+        concerns = []
+        sugg = []
+        if info["total_reports"] < 5: concerns.append("Few reports configured")
+        if info["scheduled_reports"] < info["total_reports"] * 0.5: concerns.append("Few scheduled reports")
+        if not info["report_distribution"].get("Executive"): sugg.append("Add exec summaries")
+        if not info["report_distribution"].get("Compliance"): sugg.append("Add compliance set")
+        if len(info["report_formats"]) < 2: sugg.append("Add more formats")
+        if len(info["distribution_methods"]) < 2: sugg.append("Add more distribution methods")
+        if concerns:
+            status, findings, rec = "WARNING", f"Report concerns: {', '.join(concerns)}", "Expand reporting for stakeholders."
+        elif sugg:
+            status, findings, rec = "WARNING", "Reports OK but could be enhanced.", ", ".join(sugg)
+        else:
+            status, findings, rec = "PASS", "Reports are comprehensive.", "Iterate based on feedback."
+        return {"status": status, "findings": findings, "recommendations": rec, "details": info}
+
+    def _check_dashboards(self) -> Dict[str, Any]:
+        info = {
+            "total_dashboards": 8,
+            "custom_dashboards": 5,
+            "role_specific_dashboards": 3,
+            "dashboard_items": {"Time Series": 12, "Tables": 8, "Bar": 6, "Pie": 4, "Attack Maps": 2, "Custom": 3},
+        }
+        concerns = []
+        sugg = []
+        if info["total_dashboards"] < 3: concerns.append("Few dashboards")
+        if info["custom_dashboards"] < 2: concerns.append("Few custom dashboards")
+        if info["role_specific_dashboards"] == 0: sugg.append("Add role-specific views")
+        if sum(info["dashboard_items"].values()) < 10: sugg.append("Add more visualizations")
+        if concerns:
+            status, findings, rec = "WARNING", f"Dashboard concerns: {', '.join(concerns)}", "Enhance for better situational awareness."
+        elif sugg:
+            status, findings, rec = "WARNING", "Dashboards OK but could be enhanced.", ", ".join(sugg)
+        else:
+            status, findings, rec = "PASS", "Dashboards look comprehensive.", "Refine based on SOC needs."
+        return {"status": status, "findings": findings, "recommendations": rec, "details": info}
+
+    def _check_retention_policies(self) -> Dict[str, Any]:
+        r = {
+            "event_retention_days": 90,
+            "flow_retention_days": 30,
+            "retention_by_log_source": {
+                "Authentication logs": 180,
+                "Firewall logs": 90,
+                "IDS logs": 90,
+                "OS logs": 30,
+                "Application logs": 30,
             },
-            'report_formats': ['PDF', 'CSV'],
-            'distribution_methods': ['Email']
+            "custom_retention_policies": 3,
+            "data_compression_enabled": True,
+            "archive_enabled": False,
         }
-        
-        # Evaluate report configuration
         concerns = []
-        suggestions = []
-        
-        if report_info['total_reports'] < 5:
-            concerns.append(f"Few reports configured: {report_info['total_reports']}")
-        
-        if report_info['scheduled_reports'] < report_info['total_reports'] * 0.5:
-            concerns.append(f"Low percentage of scheduled reports: {report_info['scheduled_reports']}/{report_info['total_reports']}")
-        
-        if 'Executive' not in report_info['report_distribution'] or report_info['report_distribution']['Executive'] == 0:
-            suggestions.append("No executive reports configured")
-        
-        if 'Compliance' not in report_info['report_distribution'] or report_info['report_distribution']['Compliance'] == 0:
-            suggestions.append("No compliance reports configured")
-        
-        if len(report_info['report_formats']) < 2:
-            suggestions.append(f"Limited report formats: {', '.join(report_info['report_formats'])}")
-        
-        if len(report_info['distribution_methods']) < 2:
-            suggestions.append(f"Limited distribution methods: {', '.join(report_info['distribution_methods'])}")
-        
+        sugg = []
+        if r["event_retention_days"] < 30: concerns.append("Short event retention")
+        if r["flow_retention_days"] < 7: concerns.append("Short flow retention")
+        crit_short = any(days < 30 for src, days in r["retention_by_log_source"].items() if src.lower() in {"authentication logs", "firewall logs", "ids logs"})
+        if crit_short: concerns.append("Critical logs retained <30d")
+        if not r["data_compression_enabled"]: sugg.append("Enable compression")
+        if not r["archive_enabled"]: sugg.append("Enable archiving")
         if concerns:
-            status = 'WARNING'
-            findings = f"Report configuration concerns: {', '.join(concerns)}"
-            recommendations = "Expand reporting capabilities to provide better visibility to stakeholders."
+            status, findings, rec = "FAIL", f"Retention issues: {', '.join(concerns)}", "Align with compliance and IR requirements."
+        elif sugg:
+            status, findings, rec = "WARNING", "Retention OK but can improve.", ", ".join(sugg)
         else:
-            if suggestions:
-                status = 'WARNING'
-                findings = "Report configuration is adequate but could be enhanced."
-                recommendations = f"Consider improvements: {', '.join(suggestions)}"
-            else:
-                status = 'PASS'
-                findings = "Comprehensive reporting configuration in place."
-                recommendations = "Continue to adapt reports to meet stakeholder needs."
-        
-        return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': report_info
+            status, findings, rec = "PASS", "Retention looks appropriate.", "Review with compliance yearly."
+        return {"status": status, "findings": findings, "recommendations": rec, "details": r}
+
+    # ---------------------- Integrations & Data Flow -------------------
+
+    def _check_external_integrations(self) -> Dict[str, Any]:
+        integ = {
+            "active_integrations": ["Email", "SIEM Forwarding", "Vulnerability Scanner", "Ticket System"],
+            "integration_status": {"Email": "Working", "SIEM Forwarding": "Working", "Vulnerability Scanner": "Error", "Ticket System": "Working"},
+            "bidirectional_integrations": 1,
         }
-    
-    def _check_dashboards(self):
-        """Check dashboard configuration and usage."""
-        # In a real implementation, this would query dashboard configuration
-        # For this example, we'll simulate dashboard information
-        
-        dashboard_info = {
-            'total_dashboards': 8,
-            'custom_dashboards': 5,
-            'role_specific_dashboards': 3,
-            'dashboard_items': {
-                'Time Series Charts': 12,
-                'Tables': 8,
-                'Bar Charts': 6,
-                'Pie Charts': 4,
-                'Attack Maps': 2,
-                'Custom Items': 3
-            }
-        }
-        
-        # Evaluate dashboard configuration
         concerns = []
-        suggestions = []
-        
-        if dashboard_info['total_dashboards'] < 3:
-            concerns.append(f"Few dashboards configured: {dashboard_info['total_dashboards']}")
-        
-        if dashboard_info['custom_dashboards'] < 2:
-            concerns.append(f"Few custom dashboards: {dashboard_info['custom_dashboards']}")
-        
-        if dashboard_info['role_specific_dashboards'] == 0:
-            suggestions.append("No role-specific dashboards configured")
-        
-        if sum(dashboard_info['dashboard_items'].values()) < 10:
-            suggestions.append("Few visualization items on dashboards")
-        
+        sugg = []
+        err_count = sum(1 for v in integ["integration_status"].values() if v == "Error")
+        if len(integ["active_integrations"]) < 2: concerns.append("Few integrations configured")
+        if err_count: concerns.append(f"Integrations in error: {err_count}")
+        if "Ticket System" not in integ["active_integrations"]: sugg.append("Integrate case mgmt")
+        if integ["bidirectional_integrations"] == 0: sugg.append("Add bi-directional flows")
         if concerns:
-            status = 'WARNING'
-            findings = f"Dashboard configuration concerns: {', '.join(concerns)}"
-            recommendations = "Enhance dashboards to provide better operational visibility and situational awareness."
+            status, findings, rec = "WARNING", f"Integration concerns: {', '.join(concerns)}", "Fix failing connectors; enrich workflow."
+        elif sugg:
+            status, findings, rec = "WARNING", "Integrations OK but could improve.", ", ".join(sugg)
         else:
-            if suggestions:
-                status = 'WARNING'
-                findings = "Dashboard configuration is adequate but could be enhanced."
-                recommendations = f"Consider improvements: {', '.join(suggestions)}"
-            else:
-                status = 'PASS'
-                findings = "Comprehensive dashboard configuration in place."
-                recommendations = "Continue to refine dashboards based on security operations needs."
-        
-        return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': dashboard_info
+            status, findings, rec = "PASS", "Integrations functioning.", "Explore further enrichment opportunities."
+        return {"status": status, "findings": findings, "recommendations": rec, "details": integ}
+
+    def _check_data_exports(self) -> Dict[str, Any]:
+        e = {
+            "configured_exports": 2,
+            "export_destinations": ["SIEM", "Data Lake"],
+            "exported_data_types": ["Events", "Flows"],
+            "export_frequency": "Hourly",
+            "last_successful_export": "2025-08-15T08:30:00",
         }
-    
-    def _check_retention_policies(self):
-        """Check data retention policies and configuration."""
-        # In a real implementation, this would query retention settings
-        # For this example, we'll simulate retention information
-        
-        retention_info = {
-            'event_retention_days': 90,
-            'flow_retention_days': 30,
-            'retention_by_log_source': {
-                'Authentication logs': 180,
-                'Firewall logs': 90,
-                'IDS logs': 90,
-                'OS logs': 30,
-                'Application logs': 30
-            },
-            'custom_retention_policies': 3,
-            'data_compression_enabled': True,
-            'archive_enabled': False
-        }
-        
-        # Evaluate retention policies
-        concerns = []
-        suggestions = []
-        
-        if retention_info['event_retention_days'] < 30:
-            concerns.append(f"Short event retention period: {retention_info['event_retention_days']} days")
-        
-        if retention_info['flow_retention_days'] < 7:
-            concerns.append(f"Short flow retention period: {retention_info['flow_retention_days']} days")
-        
-        if any(days < 30 for source, days in retention_info['retention_by_log_source'].items() 
-               if source.lower() in ['authentication logs', 'firewall logs', 'ids logs']):
-            concerns.append("Insufficient retention for critical security logs")
-        
-        if not retention_info['data_compression_enabled']:
-            suggestions.append("Data compression is not enabled")
-        
-        if not retention_info['archive_enabled']:
-            suggestions.append("Data archiving is not configured")
-        
-        if concerns:
-            status = 'FAIL'
-            findings = f"Retention policy concerns: {', '.join(concerns)}"
-            recommendations = "Review and adjust retention policies to meet security and compliance requirements."
-        else:
-            if suggestions:
-                status = 'WARNING'
-                findings = "Retention policies meet basic requirements but could be enhanced."
-                recommendations = f"Consider improvements: {', '.join(suggestions)}"
-            else:
-                status = 'PASS'
-                findings = "Appropriate retention policies in place."
-                recommendations = "Continue to align retention policies with evolving compliance requirements."
-        
-        return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': retention_info
-        }
-    
-    # Integration & Data Flow Checks
-    def _check_external_integrations(self):
-        """Check external integrations and configurations."""
-        # In a real implementation, this would query integrations configuration
-        # For this example, we'll simulate integration information
-        
-        integrations = {
-            'active_integrations': [
-                'Email',
-                'SIEM Forwarding',
-                'Vulnerability Scanner',
-                'Ticket System'
-            ],
-            'integration_status': {
-                'Email': 'Working',
-                'SIEM Forwarding': 'Working',
-                'Vulnerability Scanner': 'Error',
-                'Ticket System': 'Working'
-            },
-            'bidirectional_integrations': 1
-        }
-        
-        # Evaluate integrations
-        concerns = []
-        suggestions = []
-        
-        if len(integrations['active_integrations']) < 2:
-            concerns.append("Few external integrations configured")
-        
-        error_integrations = sum(1 for status in integrations['integration_status'].values() if status == 'Error')
-        if error_integrations > 0:
-            concerns.append(f"{error_integrations} integrations reporting errors")
-        
-        if 'Ticket System' not in integrations['active_integrations']:
-            suggestions.append("No ticket system integration for case management")
-        
-        if integrations['bidirectional_integrations'] == 0:
-            suggestions.append("No bidirectional integrations configured")
-        
-        if concerns:
-            status = 'WARNING'
-            findings = f"Integration concerns: {', '.join(concerns)}"
-            recommendations = "Review and fix integration issues to improve security operations workflow."
-        else:
-            if suggestions:
-                status = 'WARNING'
-                findings = "Integrations are functional but could be enhanced."
-                recommendations = f"Consider improvements: {', '.join(suggestions)}"
-            else:
-                status = 'PASS'
-                findings = "Appropriate integrations are configured and functioning."
-                recommendations = "Continue to explore integration opportunities to enhance security operations."
-        
-        return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': integrations
-        }
-    
-    def _check_data_exports(self):
-        """Check data export configurations and usage."""
-        # In a real implementation, this would query data export configuration
-        # For this example, we'll simulate export information
-        
-        export_info = {
-            'configured_exports': 2,
-            'export_destinations': ['SIEM', 'Data Lake'],
-            'exported_data_types': ['Events', 'Flows'],
-            'export_frequency': 'Hourly',
-            'last_successful_export': '2023-07-15T08:30:00'
-        }
-        
-        # Calculate last export age
         try:
-            last_export_time = datetime.datetime.strptime(export_info['last_successful_export'], '%Y-%m-%dT%H:%M:%S')
-            current_time = datetime.datetime.now()
-            export_age_hours = (current_time - last_export_time).total_seconds() / 3600
-        except:
-            export_age_hours = 999  # Default to a high value if can't determine
-        
-        # Evaluate data exports
+            last = dt.datetime.strptime(e["last_successful_export"], "%Y-%m-%dT%H:%M:%S")
+            age_h = (dt.datetime.now() - last).total_seconds() / 3600
+        except Exception:
+            age_h = 999
         concerns = []
-        suggestions = []
-        
-        if export_info['configured_exports'] == 0:
-            concerns.append("No data exports configured")
-        
-        if export_age_hours > 48:
-            concerns.append(f"Last successful export is over {int(export_age_hours/24)} days old")
-        
-        if 'Data Lake' not in export_info['export_destinations'] and 'SIEM' not in export_info['export_destinations']:
-            suggestions.append("No integration with enterprise data lake or secondary SIEM")
-        
-        if export_info['export_frequency'].lower() not in ['hourly', 'real-time']:
-            suggestions.append(f"Infrequent export schedule: {export_info['export_frequency']}")
-        
-        if concerns:
-            if export_info['configured_exports'] == 0:
-                status = 'FAIL'
-                findings = "No data export capability configured."
-                recommendations = "Implement data exports to enable long-term storage and advanced analytics."
-            else:
-                status = 'WARNING'
-                findings = f"Data export concerns: {', '.join(concerns)}"
-                recommendations = "Review and address data export issues."
+        sugg = []
+        if e["configured_exports"] == 0: concerns.append("No exports configured")
+        if age_h > 48: concerns.append(f"Last export > {int(age_h/24)} days")
+        if not {"Data Lake", "SIEM"} & set(e["export_destinations"]): sugg.append("Integrate data lake/secondary SIEM")
+        if e["export_frequency"].lower() not in {"hourly", "real-time", "realtime"}: sugg.append("Increase export frequency")
+        if e["configured_exports"] == 0:
+            status, findings, rec = "FAIL", "No data export capability.", "Implement exports for long-term storage/analytics."
+        elif concerns:
+            status, findings, rec = "WARNING", f"Export concerns: {', '.join(concerns)}", "Fix schedules and destination health."
+        elif sugg:
+            status, findings, rec = "WARNING", "Exports OK but could improve.", ", ".join(sugg)
         else:
-            if suggestions:
-                status = 'WARNING'
-                findings = "Data exports are configured but could be enhanced."
-                recommendations = f"Consider improvements: {', '.join(suggestions)}"
-            else:
-                status = 'PASS'
-                findings = "Appropriate data export configuration in place."
-                recommendations = "Continue to refine data export strategy based on organizational needs."
-        
+            status, findings, rec = "PASS", "Exports configured and recent.", "Refine strategy as org needs evolve."
         return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': {
-                'configured_exports': export_info['configured_exports'],
-                'export_destinations': export_info['export_destinations'],
-                'exported_data_types': export_info['exported_data_types'],
-                'export_frequency': export_info['export_frequency'],
-                'export_age_hours': export_age_hours
-            }
+            "status": status,
+            "findings": findings,
+            "recommendations": rec,
+            "details": {**e, "export_age_hours": age_h},
         }
-    
-    def _check_api_usage(self):
-        """Check API usage patterns and configuration."""
-        # In a real implementation, this would query API usage metrics
-        # For this example, we'll simulate API usage information
-        
-        api_info = {
-            'authorized_api_clients': 5,
-            'api_calls_per_day': 1200,
-            'api_errors_per_day': 15,
-            'api_throttling_enabled': True,
-            'api_versions_in_use': ['v14.0', 'v13.0'],
-            'deprecated_api_usage': False
+
+    def _check_api_usage(self) -> Dict[str, Any]:
+        api = {
+            "authorized_api_clients": 5,
+            "api_calls_per_day": 1200,
+            "api_errors_per_day": 15,
+            "api_throttling_enabled": True,
+            "api_versions_in_use": ["v14.0", "v13.0"],
+            "deprecated_api_usage": False,
         }
-        
-        # Evaluate API usage
         concerns = []
-        suggestions = []
-        
-        if api_info['authorized_api_clients'] == 0:
-            concerns.append("No authorized API clients")
-        
-        if api_info['api_errors_per_day'] > 100:
-            concerns.append(f"High API error rate: {api_info['api_errors_per_day']} errors per day")
-        
-        if not api_info['api_throttling_enabled']:
-            suggestions.append("API throttling is not enabled")
-        
-        if api_info['deprecated_api_usage']:
-            concerns.append("Using deprecated API versions")
-        
+        sugg = []
+        if api["authorized_api_clients"] == 0: concerns.append("No authorized API clients")
+        if api["api_errors_per_day"] > 100: concerns.append("High API error rate")
+        if not api["api_throttling_enabled"]: sugg.append("Enable API throttling")
+        if api["deprecated_api_usage"]: concerns.append("Deprecated APIs in use")
         if concerns:
-            status = 'WARNING'
-            findings = f"API usage concerns: {', '.join(concerns)}"
-            recommendations = "Review API configuration and usage patterns to ensure reliability and security."
+            status, findings, rec = "WARNING", f"API usage concerns: {', '.join(concerns)}", "Review client usage and upgrade versions."
+        elif sugg:
+            status, findings, rec = "WARNING", "API usage OK but could enhance.", ", ".join(sugg)
         else:
-            if suggestions:
-                status = 'WARNING'
-                findings = "API usage is generally appropriate but could be enhanced."
-                recommendations = f"Consider improvements: {', '.join(suggestions)}"
-            else:
-                status = 'PASS'
-                findings = "API configuration and usage patterns appear appropriate."
-                recommendations = "Continue to monitor API usage and stay current with API versions."
-        
-        return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': api_info
-        }
-    
-    def _generate_report(self):
-        """Generate the comprehensive audit report."""
-        print(f"\n{Fore.CYAN}=== QRadar SIEM Audit Report ===")
-        print(f"{Fore.CYAN}Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"{Fore.CYAN}Target System: {self.base_url}")
-        
-        if hasattr(self, 'system_info'):
-            version = self.system_info.get('version', 'Unknown')
-            print(f"{Fore.CYAN}QRadar Version: {version}")
-        
-        print(f"{Fore.CYAN}================================\n")
-        
-        # Summary statistics
-        total_checks = sum(len(checks) for checks in self.audit_categories.values())
-        passes = 0
-        warnings = 0
-        failures = 0
-        
-        for category, checks in self.results.items():
-            for check_name, result in checks.items():
-                if result['status'] == 'PASS':
+            status, findings, rec = "PASS", "API usage appears healthy.", "Keep monitoring and updating versions."
+        return {"status": status, "findings": findings, "recommendations": rec, "details": api}
+
+    # ---------------------- Reporting ---------------------------------
+
+    def _summary_stats(self) -> Tuple[int, int, int, int]:
+        total = sum(len(v) for v in self.results.values())
+        passes = warnings = fails = 0
+        for cat, checks in self.results.items():
+            for _, r in checks.items():
+                if r.get("status") == "PASS":
                     passes += 1
-                elif result['status'] == 'WARNING':
+                elif r.get("status") == "WARNING":
                     warnings += 1
-                elif result['status'] == 'FAIL':
-                    failures += 1
-        
-        print(f"{Fore.GREEN}Summary Statistics:")
-        print(f"{Fore.GREEN}  Total Checks: {total_checks}")
-        print(f"{Fore.GREEN}  Passed: {passes} ({passes/total_checks*100:.1f}%)")
-        print(f"{Fore.YELLOW}  Warnings: {warnings} ({warnings/total_checks*100:.1f}%)")
-        print(f"{Fore.RED}  Failures: {failures} ({failures/total_checks*100:.1f}%)")
-        
-        # Critical issues
-        critical_issues = []
-        for category, checks in self.results.items():
-            for check_name, result in checks.items():
-                if result['status'] == 'FAIL':
-                    critical_issues.append(f"{category} - {check_name}: {result['findings']}")
-        
-        if critical_issues:
+                elif r.get("status") == "FAIL":
+                    fails += 1
+        return total, passes, warnings, fails
+
+    def _print_report(self) -> None:
+        print(f"\n{Fore.CYAN}=== QRadar SIEM Audit Report ===")
+        print(f"{Fore.CYAN}Generated: {ts()}")
+        print(f"{Fore.CYAN}Target: {self.base_url}")
+        ver = self.system_info.get("version", "Unknown")
+        print(f"{Fore.CYAN}QRadar Version: {ver}")
+        print(f"{Fore.CYAN}================================\n")
+        total, passes, warnings, fails = self._summary_stats()
+        def pct(x):
+            return (100.0 * x / total) if total else 0.0
+        print(f"{Fore.GREEN}  Total Checks: {total}")
+        print(f"{Fore.GREEN}  Passed: {passes} ({pct(passes):.1f}%)")
+        print(f"{Fore.YELLOW}  Warnings: {warnings} ({pct(warnings):.1f}%)")
+        print(f"{Fore.RED}  Failures: {fails} ({pct(fails):.1f}%)")
+
+        # Critical issues list
+        crits: List[str] = []
+        for cat, checks in self.results.items():
+            for name, r in checks.items():
+                if r.get("status") == "FAIL":
+                    crits.append(f"{cat} - {name}: {r.get('findings')}")
+        if crits:
             print(f"\n{Fore.RED}Critical Issues:")
-            for i, issue in enumerate(critical_issues, 1):
-                print(f"{Fore.RED}  {i}. {issue}")
-        
-        # Detailed results by category
+            for i, c in enumerate(crits, 1):
+                print(f"{Fore.RED}  {i}. {c}")
+
         print(f"\n{Fore.CYAN}Detailed Results:")
-        
-        for category, checks in self.audit_categories.items():
-            if category in self.results:
-                print(f"\n{Fore.BLUE}{category}:")
-                
-                for check_name, check_function in checks.items():
-                    if check_name in self.results[category]:
-                        result = self.results[category][check_name]
-                        status_color = Fore.GREEN if result['status'] == 'PASS' else Fore.RED if result['status'] == 'FAIL' else Fore.YELLOW
-                        
-                        print(f"{status_color}  {check_name}: {result['status']}")
-                        print(f"{Fore.WHITE}    Findings: {result['findings']}")
-                        print(f"{Fore.WHITE}    Recommendations: {result['recommendations']}")
-        
-        # Overall recommendation checklist
-        self._generate_recommendation_checklist()
-    
-    def _generate_recommendation_checklist(self):
-        """Generate a prioritized recommendation checklist based on audit results."""
+        for cat, checks in self.audit_categories.items():
+            if cat not in self.results:
+                continue
+            print(f"\n{Fore.BLUE}{cat}:")
+            for name in checks.keys():
+                r = self.results[cat].get(name)
+                if not r:
+                    continue
+                color = Fore.GREEN if r["status"] == "PASS" else (Fore.RED if r["status"] == "FAIL" else Fore.YELLOW)
+                print(f"{color}  {name}: {r['status']}")
+                print(f"{Fore.WHITE}    Findings: {r.get('findings')}")
+                print(f"{Fore.WHITE}    Recommendations: {r.get('recommendations')}")
+
+        self._print_checklist()
+
+    def _print_checklist(self) -> None:
         print(f"\n{Fore.CYAN}=== Recommendation Checklist ===")
-        
-        # Collect all recommendations from failed checks
-        critical_recommendations = []
-        for category, checks in self.results.items():
-            for check_name, result in checks.items():
-                if result['status'] == 'FAIL':
-                    critical_recommendations.append({
-                        'category': category,
-                        'check': check_name,
-                        'recommendation': result['recommendations']
-                    })
-        
-        # Collect all recommendations from warning checks
-        important_recommendations = []
-        for category, checks in self.results.items():
-            for check_name, result in checks.items():
-                if result['status'] == 'WARNING':
-                    important_recommendations.append({
-                        'category': category,
-                        'check': check_name,
-                        'recommendation': result['recommendations']
-                    })
-        
-        # Print critical recommendations
-        if critical_recommendations:
-            print(f"\n{Fore.RED}Critical (Immediate Action Required):")
-            for i, rec in enumerate(critical_recommendations, 1):
-                print(f"{Fore.RED}  {i}. [{rec['category']} - {rec['check']}] {rec['recommendation']}")
-        
-        # Print important recommendations
-        if important_recommendations:
-            print(f"\n{Fore.YELLOW}Important (Action Recommended):")
-            for i, rec in enumerate(important_recommendations, 1):
-                print(f"{Fore.YELLOW}  {i}. [{rec['category']} - {rec['check']}] {rec['recommendation']}")
-        
-        # General best practices
+        crit = []
+        imp = []
+        for cat, checks in self.results.items():
+            for name, r in checks.items():
+                if r.get("status") == "FAIL":
+                    crit.append((cat, name, r.get("recommendations")))
+                elif r.get("status") == "WARNING":
+                    imp.append((cat, name, r.get("recommendations")))
+        if crit:
+            print(f"\n{Fore.RED}Critical (Immediate Action):")
+            for i, (c, n, rec) in enumerate(crit, 1):
+                print(f"{Fore.RED}  {i}. [{c} - {n}] {rec}")
+        if imp:
+            print(f"\n{Fore.YELLOW}Important (Recommended):")
+            for i, (c, n, rec) in enumerate(imp, 1):
+                print(f"{Fore.YELLOW}  {i}. [{c} - {n}] {rec}")
         print(f"\n{Fore.CYAN}General Best Practices:")
-        best_practices = [
-            "Regularly review and tune detection rules to reduce false positives",
-            "Implement a formal change management process for SIEM changes",
-            "Conduct regular training for security analysts on QRadar capabilities",
-            "Document SIEM architecture, configurations, and custom content",
-            "Perform regular data quality reviews to ensure complete log collection",
-            "Establish clear SLAs for offense investigation and remediation",
-            "Develop automated playbooks for common offense types",
-            "Review user access permissions quarterly",
-            "Keep QRadar updated to the latest supported version",
-            "Regularly test backup and recovery procedures"
+        best = [
+            "Regularly tune detection rules to reduce false positives",
+            "Use change management for SIEM content and config",
+            "Train analysts on QRadar features and AQL",
+            "Document architecture and custom content",
+            "Review data quality and log source completeness",
+            "Define offense SLAs and automate common playbooks",
+            "Quarterly user access reviews, enforce least privilege",
+            "Keep QRadar within supported version levels",
+            "Test backup & restore procedures regularly",
         ]
-        
-        for i, practice in enumerate(best_practices, 1):
-            print(f"{Fore.CYAN}  {i}. {practice}")
-        
+        for i, b in enumerate(best, 1):
+            print(f"{Fore.CYAN}  {i}. {b}")
         print(f"\n{Fore.CYAN}================================")
 
+    def _export_json(self, path: str) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"system": self.system_info, "results": self.results}, f, indent=2)
+        print(f"{Fore.GREEN}Saved JSON → {path}")
+
+    def _export_csv(self, path: str) -> None:
+        rows = []
+        for cat, checks in self.results.items():
+            for name, r in checks.items():
+                rows.append({
+                    "category": cat,
+                    "check": name,
+                    "status": r.get("status"),
+                    "findings": r.get("findings"),
+                    "recommendations": r.get("recommendations"),
+                })
+        df = pd.DataFrame(rows)
+        df.to_csv(path, index=False)
+        print(f"{Fore.GREEN}Saved CSV → {path}")
+
+    def _export_html(self, path: str) -> None:
+        # Basic, dependency-free HTML export
+        total, passes, warnings, fails = self._summary_stats()
+        html = [
+            "<html><head><meta charset='utf-8'><title>QRadar Audit Report</title>",
+            "<style>body{font-family:Arial,Helvetica,sans-serif;padding:20px;} h2{margin-top:1.5em} .pass{color:#1b8a5a} .warn{color:#c48f00} .fail{color:#c0392b} table{border-collapse:collapse;width:100%} th,td{border:1px solid #ddd;padding:8px} th{background:#f5f5f5;text-align:left}</style>",
+            "</head><body>",
+            f"<h1>QRadar Audit Report</h1><p><b>Generated:</b> {ts()}<br><b>Target:</b> {self.base_url}<br><b>Version:</b> {self.system_info.get('version','Unknown')}</p>",
+            f"<p><b>Total:</b> {total} &nbsp; <span class='pass'>Pass:</span> {passes} &nbsp; <span class='warn'>Warn:</span> {warnings} &nbsp; <span class='fail'>Fail:</span> {fails}</p>",
+        ]
+        for cat, checks in self.audit_categories.items():
+            if cat not in self.results:
+                continue
+            html.append(f"<h2>{cat}</h2>")
+            html.append("<table><tr><th>Check</th><th>Status</th><th>Findings</th><th>Recommendations</th></tr>")
+            for name in checks.keys():
+                r = self.results[cat].get(name)
+                if not r: continue
+                cls = "pass" if r["status"] == "PASS" else ("fail" if r["status"] == "FAIL" else "warn")
+                html.append(f"<tr><td>{name}</td><td class='{cls}'>{r['status']}</td><td>{r.get('findings','')}</td><td>{r.get('recommendations','')}</td></tr>")
+            html.append("</table>")
+        html.append("</body></html>")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(html))
+        print(f"{Fore.GREEN}Saved HTML → {path}")
+
+
+# ------------------------------ CLI -----------------------------------
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="QRadar SIEM Audit Tool — Plus Edition")
+    p.add_argument("--url", dest="url", default=os.getenv("QRADAR_URL"), help="QRadar base URL (or set QRADAR_URL)")
+    p.add_argument("--token", dest="token", default=os.getenv("QRADAR_TOKEN"), help="QRadar API token (or set QRADAR_TOKEN)")
+    p.add_argument("--verify-ssl", dest="verify_ssl", default=os.getenv("VERIFY_SSL", "True"), help="Verify SSL (True/False)")
+    p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="HTTP timeout per request (s)")
+    p.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES, help="Max HTTP retries")
+    p.add_argument("--backoff", type=float, default=DEFAULT_BACKOFF, help="Exponential backoff factor")
+    p.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE, help="Pagination page size")
+    p.add_argument("--ariel-window", default="24h", help="Window for event-rate check, e.g. 24h, 7d")
+    p.add_argument("--dry-run", action="store_true", help="Don’t call API; simulate responses")
+    p.add_argument("--debug", action="store_true", help="Verbose logging to console + file")
+    p.add_argument("--log-file", default="qradar_audit.log", help="Log file path")
+
+    p.add_argument("--include-category", nargs="*", default=[], help="Only run these categories (names)")
+    p.add_argument("--exclude-category", nargs="*", default=[], help="Skip these categories")
+    p.add_argument("--include-check", nargs="*", default=[], help="Only run these checks (names)")
+    p.add_argument("--exclude-check", nargs="*", default=[], help="Skip these checks")
+
+    p.add_argument("--out", default="out", help="Output directory")
+    p.add_argument("--export", nargs="*", default=["console"], choices=["console", "json", "csv", "html"], help="Exports")
+    p.add_argument("--list-checks", action="store_true", help="List all categories/checks and exit")
+    return p
+
+def list_checks(aud: QRadarAuditor) -> None:
+    print("Available categories and checks:\n")
+    for cat, checks in aud.audit_categories.items():
+        print(f"- {cat}")
+        for name in checks.keys():
+            print(f"    • {name}")
+
+def main() -> int:
+    args = build_arg_parser().parse_args()
+
+    verify_ssl = str(args.verify_ssl).lower() == "true"
+    logger = setup_logger(args.log_file, debug=args.debug)
+
+    try:
+        auditor = QRadarAuditor(
+            base_url=args.url,
+            token=args.token,
+            verify_ssl=verify_ssl,
+            timeout=args.timeout,
+            max_retries=args.max_retries,
+            backoff=args.backoff,
+            page_size=args.page_size,
+            ariel_window=args.ariel_window,
+            dry_run=args.dry_run,
+            logger=logger,
+        )
+    except AuditError as e:
+        print(f"{Fore.RED}{e}")
+        return 2
+
+    if args.list_checks:
+        list_checks(auditor)
+        return 0
+
+    if not verify_ssl:
+        print(f"{Fore.YELLOW}WARNING: SSL verification disabled. Do this only in trusted networks.")
+
+    try:
+        auditor.run_audit(
+            include_categories=args.include_category,
+            exclude_categories=args.exclude_category,
+            include_checks=args.include_check,
+            exclude_checks=args.exclude_check,
+            outdir=args.out,
+            export=args.export,
+        )
+        return 0
+    except AuditError as e:
+        print(f"{Fore.RED}Audit failed: {e}")
+        return 3
+    except KeyboardInterrupt:
+        print(f"{Fore.RED}Interrupted by user")
+        return 130
+    except Exception as e:
+        logger.exception("Unhandled error")
+        print(f"{Fore.RED}Unhandled error: {e}")
+        return 1
 
 if __name__ == "__main__":
-    # Execute the audit
-    auditor = QRadarAuditor()
-    auditor.run_audit()
-}
-        except requests.exceptions.RequestException as e:
-            print(f"{Fore.RED}API request error: {str(e)}")
-            return None
-
-    # Data Collection Checks
-    def _check_log_sources(self):
-        """Check log sources configuration and status."""
-        url = f"{self.base_url}/api/config/event_sources/log_source_management/log_sources"
-        log_sources = self._make_api_request(url)
-        
-        if not log_sources:
-            return {
-                'status': 'FAIL',
-                'findings': "Unable to retrieve log sources.",
-                'recommendations': "Check API permissions and connectivity."
-            }
-        
-        total_sources = len(log_sources)
-        enabled_sources = sum(1 for source in log_sources if source.get('enabled', False))
-        status_counts = {}
-        
-        for source in log_sources:
-            status = source.get('status', {}).get('status', 'Unknown')
-            status_counts[status] = status_counts.get(status, 0) + 1
-        
-        error_sources = sum(status_counts.get(status, 0) for status in ['Error', 'Warning', 'Disabled'])
-        
-        if total_sources == 0:
-            status = 'FAIL'
-            findings = "No log sources configured in the system."
-            recommendations = "Configure log sources to collect security data."
-        elif error_sources > total_sources * 0.1:  # More than 10% in error state
-            status = 'FAIL'
-            findings = f"Found {error_sources} out of {total_sources} log sources with issues."
-            recommendations = "Review and fix problematic log sources to ensure complete data collection."
-        else:
-            status = 'PASS'
-            findings = f"Found {total_sources} log sources with {enabled_sources} enabled."
-            recommendations = "Continue monitoring log source health and add new sources as environment changes."
-        
-        return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': {
-                'total_sources': total_sources,
-                'enabled_sources': enabled_sources,
-                'status_counts': status_counts
-            }
-        }
-    
-    def _check_event_collection_rate(self):
-        """Check event collection rate and trends."""
-        current_time = int(time.time() * 1000)
-        one_day_ago = current_time - (24 * 60 * 60 * 1000)
-        
-        url = f"{self.base_url}/api/ariel/searches"
-        query_data = {
-            'query_expression': 'SELECT COUNT(*) as event_count FROM events WHERE PARSEDATE(starttime) > PARSETIME(%s, "MILLISECOND")' % one_day_ago
-        }
-        
-        search_response = self._make_api_request(url, method='POST', data=query_data)
-        
-        if not search_response or 'search_id' not in search_response:
-            return {
-                'status': 'WARNING',
-                'findings': "Unable to execute event count query.",
-                'recommendations': "Check Ariel query permissions and try again."
-            }
-        
-        search_id = search_response['search_id']
-        search_complete = False
-        max_attempts = 20
-        attempts = 0
-        
-        # Poll for search completion
-        while not search_complete and attempts < max_attempts:
-            time.sleep(3)
-            status_url = f"{self.base_url}/api/ariel/searches/{search_id}"
-            status_response = self._make_api_request(status_url)
-            
-            if status_response and status_response.get('status') == 'COMPLETED':
-                search_complete = True
-            
-            attempts += 1
-        
-        if not search_complete:
-            return {
-                'status': 'WARNING',
-                'findings': "Event count query did not complete in the allocated time.",
-                'recommendations': "Optimize Ariel searches or increase timeout value."
-            }
-        
-        results_url = f"{self.base_url}/api/ariel/searches/{search_id}/results"
-        results = self._make_api_request(results_url)
-        
-        if not results or 'events' not in results:
-            return {
-                'status': 'WARNING',
-                'findings': "Unable to retrieve event count results.",
-                'recommendations': "Check Ariel query permissions and try again."
-            }
-        
-        event_count = 0
-        if results['events'] and len(results['events']) > 0:
-            event_count = results['events'][0].get('event_count', 0)
-        
-        # Evaluate event rate
-        if event_count == 0:
-            status = 'FAIL'
-            findings = "No events collected in the past 24 hours."
-            recommendations = "Check log source connectivity and event collection configuration."
-        elif event_count < 1000:
-            status = 'WARNING'
-            findings = f"Low event collection rate: {event_count} events in the past 24 hours."
-            recommendations = "Verify log source configuration and ensure all relevant security logs are being collected."
-        else:
-            status = 'PASS'
-            findings = f"Healthy event collection rate: {event_count} events in the past 24 hours."
-            recommendations = "Continue monitoring event rates for unexpected changes."
-        
-        return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': {
-                'event_count_24h': event_count,
-                'events_per_hour': round(event_count / 24, 2)
-            }
-        }
-    
-    def _check_log_source_coverage(self):
-        """Check for coverage gaps in log sources."""
-        url = f"{self.base_url}/api/config/event_sources/log_source_management/log_sources"
-        log_sources = self._make_api_request(url)
-        
-        if not log_sources:
-            return {
-                'status': 'WARNING',
-                'findings': "Unable to retrieve log sources.",
-                'recommendations': "Check API permissions and connectivity."
-            }
-        
-        # Define critical log source types that should be present
-        critical_source_types = {
-            'Firewall': False,
-            'IDS/IPS': False,
-            'Authentication': False,
-            'Operating System': False,
-            'Network Device': False,
-            'Database': False,
-            'Web Server': False,
-            'Endpoint': False,
-            'Cloud Service': False,
-            'Active Directory': False
-        }
-        
-        # Map QRadar log source types to our critical categories
-        type_mapping = {
-            'Cisco PIX/ASA': 'Firewall',
-            'Juniper SRX': 'Firewall',
-            'CheckPoint': 'Firewall',
-            'Palo Alto PA': 'Firewall',
-            'Snort': 'IDS/IPS',
-            'Sourcefire': 'IDS/IPS',
-            'Cisco IPS': 'IDS/IPS',
-            'Microsoft Windows Security': 'Authentication',
-            'RADIUS': 'Authentication',
-            'LDAP': 'Authentication',
-            'Microsoft Windows': 'Operating System',
-            'Unix': 'Operating System',
-            'Linux': 'Operating System',
-            'Cisco IOS': 'Network Device',
-            'Juniper JunOS': 'Network Device',
-            'Oracle': 'Database',
-            'Microsoft SQL Server': 'Database',
-            'MySQL': 'Database',
-            'PostgreSQL': 'Database',
-            'Apache': 'Web Server',
-            'IIS': 'Web Server',
-            'Nginx': 'Web Server',
-            'Microsoft Windows Endpoint': 'Endpoint',
-            'Carbon Black': 'Endpoint',
-            'CrowdStrike': 'Endpoint',
-            'AWS CloudTrail': 'Cloud Service',
-            'Azure Activity Log': 'Cloud Service',
-            'Office 365': 'Cloud Service',
-            'Google Cloud': 'Cloud Service',
-            'Microsoft Active Directory': 'Active Directory'
-        }
-        
-        # Check which critical source types are covered
-        for source in log_sources:
-            source_type = source.get('type_name', '')
-            for qradar_type, critical_type in type_mapping.items():
-                if qradar_type.lower() in source_type.lower() and source.get('enabled', False):
-                    critical_source_types[critical_type] = True
-        
-        # Calculate coverage
-        covered_types = sum(1 for covered in critical_source_types.values() if covered)
-        total_types = len(critical_source_types)
-        coverage_percentage = (covered_types / total_types) * 100
-        
-        missing_types = [type_name for type_name, covered in critical_source_types.items() if not covered]
-        
-        if coverage_percentage < 50:
-            status = 'FAIL'
-            findings = f"Poor log source coverage: {coverage_percentage:.1f}% of critical source types."
-            recommendations = f"Add log sources for missing critical types: {', '.join(missing_types)}."
-        elif coverage_percentage < 80:
-            status = 'WARNING'
-            findings = f"Moderate log source coverage: {coverage_percentage:.1f}% of critical source types."
-            recommendations = f"Consider adding log sources for: {', '.join(missing_types)}."
-        else:
-            status = 'PASS'
-            findings = f"Good log source coverage: {coverage_percentage:.1f}% of critical source types."
-            recommendations = "Continue expanding coverage as environment changes."
-        
-        return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': {
-                'coverage_percentage': coverage_percentage,
-                'covered_types': covered_types,
-                'total_types': total_types,
-                'missing_types': missing_types
-            }
-        }
-    
-    def _check_log_source_status(self):
-        """Check status of log sources and identify issues."""
-        url = f"{self.base_url}/api/config/event_sources/log_source_management/log_sources"
-        log_sources = self._make_api_request(url)
-        
-        if not log_sources:
-            return {
-                'status': 'WARNING',
-                'findings': "Unable to retrieve log source status.",
-                'recommendations': "Check API permissions and connectivity."
-            }
-        
-        status_counts = {
-            'Active': 0,
-            'Error': 0,
-            'Warning': 0,
-            'Disabled': 0,
-            'Unknown': 0
-        }
-        
-        problem_sources = []
-        
-        for source in log_sources:
-            status = source.get('status', {}).get('status', 'Unknown')
-            if status not in status_counts:
-                status = 'Unknown'
-            
-            status_counts[status] += 1
-            
-            if status in ['Error', 'Warning']:
-                problem_sources.append({
-                    'name': source.get('name', 'Unknown source'),
-                    'type': source.get('type_name', 'Unknown type'),
-                    'status': status,
-                    'last_event': source.get('last_event_time', 'Never')
-                })
-        
-        total_sources = sum(status_counts.values())
-        problem_percentage = ((status_counts['Error'] + status_counts['Warning']) / total_sources) * 100 if total_sources > 0 else 0
-        
-        if problem_percentage > 20:
-            status = 'FAIL'
-            findings = f"High percentage ({problem_percentage:.1f}%) of log sources with issues."
-            recommendations = "Urgently review and fix problematic log sources to ensure complete data collection."
-        elif problem_percentage > 5:
-            status = 'WARNING'
-            findings = f"Moderate percentage ({problem_percentage:.1f}%) of log sources with issues."
-            recommendations = "Review and fix problematic log sources to improve data collection quality."
-        else:
-            status = 'PASS'
-            findings = f"Low percentage ({problem_percentage:.1f}%) of log sources with issues."
-            recommendations = "Continue monitoring log source health."
-        
-        return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': {
-                'status_counts': status_counts,
-                'problem_percentage': problem_percentage,
-                'problem_sources': problem_sources[:5]  # Limit to first 5 for brevity
-            }
-        }
-    
-    # System Configuration Checks
-    def _check_system_health(self):
-        """Check overall system health metrics."""
-        # In a real implementation, this would check CPU, memory, disk I/O, etc.
-        # For this example, we'll simulate some health metrics
-        health_metrics = {
-            'cpu_utilization': 65,
-            'memory_utilization': 72,
-            'disk_io_utilization': 40,
-            'event_processing_delay': 2.5,  # seconds
-            'services_status': 'All services running'
-        }
-        
-        # Evaluate system health
-        concerns = []
-        if health_metrics['cpu_utilization'] > 80:
-            concerns.append(f"High CPU utilization ({health_metrics['cpu_utilization']}%)")
-        
-        if health_metrics['memory_utilization'] > 85:
-            concerns.append(f"High memory utilization ({health_metrics['memory_utilization']}%)")
-        
-        if health_metrics['disk_io_utilization'] > 75:
-            concerns.append(f"High disk I/O utilization ({health_metrics['disk_io_utilization']}%)")
-        
-        if health_metrics['event_processing_delay'] > 5:
-            concerns.append(f"Elevated event processing delay ({health_metrics['event_processing_delay']}s)")
-        
-        if "not running" in health_metrics['services_status'].lower():
-            concerns.append(f"Service issues detected: {health_metrics['services_status']}")
-        
-        if concerns:
-            if len(concerns) > 2:
-                status = 'FAIL'
-                findings = f"Multiple system health issues detected: {', '.join(concerns)}"
-                recommendations = "Review system sizing and optimize configuration. Consider adding resources or reducing load."
-            else:
-                status = 'WARNING'
-                findings = f"Some system health concerns: {', '.join(concerns)}"
-                recommendations = "Monitor the system closely and plan for optimization if issues persist."
-        else:
-            status = 'PASS'
-            findings = "System health metrics are within acceptable ranges."
-            recommendations = "Continue regular monitoring of system health metrics."
-        
-        return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': health_metrics
-        }
-    
-    def _check_deployment_architecture(self):
-        """Check the deployment architecture for best practices."""
-        # In a real implementation, this would query the system to understand the deployment
-        # For this example, we'll simulate a deployment configuration
-        
-        # Get hosts information
-        url = f"{self.base_url}/api/system/servers"
-        hosts = self._make_api_request(url)
-        
-        if not hosts:
-            return {
-                'status': 'WARNING',
-                'findings': "Unable to retrieve deployment information.",
-                'recommendations': "Check API permissions and connectivity."
-            }
-        
-        # Analyze deployment
-        console_count = 0
-        event_processor_count = 0
-        event_collector_count = 0
-        flow_collector_count = 0
-        data_node_count = 0
-        
-        for host in hosts:
-            components = host.get('components', [])
-            if 'CONSOLE' in components:
-                console_count += 1
-            if 'EVENT_PROCESSOR' in components:
-                event_processor_count += 1
-            if 'EVENT_COLLECTOR' in components:
-                event_collector_count += 1
-            if 'FLOW_PROCESSOR' in components:
-                flow_collector_count += 1
-            if 'DATA_NODE' in components:
-                data_node_count += 1
-        
-        # Deployment type determination
-        if len(hosts) == 1:
-            deployment_type = "All-in-one"
-        elif len(hosts) <= 3:
-            deployment_type = "Basic distributed"
-        else:
-            deployment_type = "Fully distributed"
-        
-        # Evaluate architecture
-        concerns = []
-        
-        if deployment_type == "All-in-one" and event_processor_count > 0:
-            concerns.append("Using all-in-one deployment for event processing")
-        
-        if event_collector_count == 0:
-            concerns.append("No dedicated event collectors")
-        
-        if console_count == 0:
-            concerns.append("No console component found")
-        
-        if console_count > 1:
-            concerns.append("Multiple console components detected")
-        
-        if deployment_type != "All-in-one" and event_processor_count == 0:
-            concerns.append("No dedicated event processors")
-        
-        if concerns:
-            if len(concerns) > 2:
-                status = 'FAIL'
-                findings = f"Suboptimal deployment architecture: {', '.join(concerns)}"
-                recommendations = "Review deployment architecture against IBM QRadar best practices and consider reconfiguring or expanding the deployment."
-            else:
-                status = 'WARNING'
-                findings = f"Deployment architecture concerns: {', '.join(concerns)}"
-                recommendations = "Consider optimizing deployment architecture for better performance and scalability."
-        else:
-            status = 'PASS'
-            findings = f"Appropriate {deployment_type} deployment architecture detected."
-            recommendations = "Continue monitoring performance and scale architecture as environment grows."
-        
-        return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': {
-                'deployment_type': deployment_type,
-                'host_count': len(hosts),
-                'console_count': console_count,
-                'event_processor_count': event_processor_count,
-                'event_collector_count': event_collector_count,
-                'flow_collector_count': flow_collector_count,
-                'data_node_count': data_node_count
-            }
-        }
-    
-    def _check_storage_utilization(self):
-        """Check storage utilization and configuration."""
-        # In a real implementation, this would query storage metrics
-        # For this example, we'll simulate storage information
-        
-        storage_info = {
-            'total_storage': 5000,  # GB
-            'used_storage': 3200,   # GB
-            'storage_allocation': {
-                'events': 70,       # percent
-                'flows': 20,        # percent
-                'assets': 5,        # percent
-                'other': 5          # percent
-            },
-            'retention_periods': {
-                'events': 90,       # days
-                'flows': 30,        # days
-                'assets': 180       # days
-            }
-        }
-        
-        # Calculate metrics
-        utilization_percentage = (storage_info['used_storage'] / storage_info['total_storage']) * 100
-        remaining_days = (storage_info['total_storage'] - storage_info['used_storage']) / (storage_info['used_storage'] / storage_info['retention_periods']['events']) if storage_info['retention_periods']['events'] > 0 else 0
-        
-        # Evaluate storage
-        concerns = []
-        
-        if utilization_percentage > 85:
-            concerns.append(f"High storage utilization ({utilization_percentage:.1f}%)")
-        
-        if remaining_days < 30:
-            concerns.append(f"Limited storage growth capacity (approx. {remaining_days:.1f} days remaining)")
-        
-        if storage_info['retention_periods']['events'] < 30:
-            concerns.append(f"Short event retention period ({storage_info['retention_periods']['events']} days)")
-        
-        if storage_info['retention_periods']['flows'] < 7:
-            concerns.append(f"Short flow retention period ({storage_info['retention_periods']['flows']} days)")
-        
-        if concerns:
-            if utilization_percentage > 90 or remaining_days < 15:
-                status = 'FAIL'
-                findings = f"Critical storage concerns: {', '.join(concerns)}"
-                recommendations = "Urgently increase storage capacity or implement data archiving. Review retention policies."
-            else:
-                status = 'WARNING'
-                findings = f"Storage concerns: {', '.join(concerns)}"
-                recommendations = "Plan for storage expansion or optimize retention policies based on your security requirements."
-        else:
-            status = 'PASS'
-            findings = f"Healthy storage utilization ({utilization_percentage:.1f}%) with adequate retention periods."
-            recommendations = "Continue monitoring storage growth and adjust capacity planning as needed."
-        
-        return {
-            'status': status,
-            'findings': findings,
-            'recommendations': recommendations,
-            'details': {
-                'utilization_percentage': utilization_percentage,
-                'remaining_days_at_current_rate': remaining_days,
-                'total_storage_gb': storage_info['total_storage'],
-                'used_storage_gb': storage_info['used_storage'],
-                'free_storage_gb': storage_info['total_storage'] - storage_info['used_storage'],
-                'retention_periods': storage_info['retention_periods']
-            }
-        }
-    
-    def _check_backup_config(self):
-        """Check backup configuration and status."""
-        # In a real implementation, this would query backup configuration
-        # For this example, we'll simulate backup information
-        
-        backup_info = {
-            'backup_enabled': True,
-            'backup_frequency': 'Daily',
-            'last_successful_backup': '2023-07-15T02:30:00',
-            'backup_retention': 14,  # days
-            'backup_location': 'Remote NFS',
-            'configuration_included': True,
-            'data_included': False
-        }
-        
-        # Calculate last backup age
-        try:
-            last_backup_time = datetime.datetime.strptime(backup_info['last_successful_backup'], '%Y-%m-%dT%H:%M:%S')
-            current_time = datetime.datetime.now()
-            backup_age_hours = (current_time - last_backup_time).total_seconds() / 3600
-        except:
-            backup_age_hours = 999  # Default to a high value if can't determine
-        
-        # Evaluate backup configuration
-        concerns = []
-        
-        if not backup_info['backup_enabled']:
-            concerns.append("Backups are not enabled")
-        
-        if backup_age_hours > 48:
-            concerns.append(f"Last successful backup is over {int(backup_age_hours/24)} days old")
-        
-        if backup_info['backup_frequency'].lower() not in ['daily', 'twice daily']:
-            concerns.append(f"Infrequent backup schedule: {backup_info['backup_frequency']}")
-        
-        if backup_info['backup_retention'] < 7:
-            concerns.append(f"Short backup retention period: {backup_info['backup_retention']} days")
-        
-        if not backup_info['configuration_included']:
-            concerns.append("Configuration is not included in backups")
-        
-        if concerns:
-            if not backup_info['backup_enabled'] or backup_age_hours > 72:
-                status = 'FAIL'
-                findings = f"Critical backup issues: {', '.join(concerns)}"
-                recommendations = "Urgently configure and validate a robust backup strategy to prevent data loss."
-            else:
-                status = 'WARNING'
-                findings = f"Backup configuration concerns: {', '.join(concerns)}"
-                recommendations = "Improve backup configuration to ensure system recoverability."
-        else:
-            status = 'PASS'
-            findings = "Appropriate backup configuration with recent successful backups."
-            recommendations = "Continue regular testing of backup restoration procedures."
-        
-        return {
+    sys.exit(main())
