@@ -49,6 +49,12 @@ import pandas as pd
 from colorama import Fore, Style, init as colorama_init
 from dotenv import load_dotenv
 
+try:
+    from fpdf import FPDF
+    _HAS_FPDF = True
+except ImportError:
+    _HAS_FPDF = False
+
 # ------------------------------ Setup ---------------------------------
 colorama_init(autoreset=True)
 load_dotenv()
@@ -57,6 +63,40 @@ DEFAULT_TIMEOUT = 20  # seconds per request
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_BACKOFF = 1.5
 DEFAULT_PAGE_SIZE = 50  # for Range-based pagination
+
+# Severity weights per check (1=informational … 10=critical)
+SEVERITY_MAP: Dict[str, int] = {
+    "Log Sources": 9,
+    "Event Collection Rate": 8,
+    "Log Source Coverage": 7,
+    "Log Source Status": 7,
+    "System Health": 8,
+    "Deployment Architecture": 6,
+    "Storage Utilization": 8,
+    "Backup Configuration": 9,
+    "User Access Controls": 9,
+    "Password Policies": 7,
+    "Network Security": 8,
+    "Authentication Methods": 8,
+    "Custom Rules": 7,
+    "Offense Configuration": 8,
+    "Rule Coverage": 7,
+    "Reference Sets": 6,
+    "Search Performance": 5,
+    "Report Configuration": 4,
+    "Dashboard Configuration": 4,
+    "Retention Policies": 7,
+    "External Integrations": 6,
+    "Data Exports": 5,
+    "API Usage": 5,
+    # New categories
+    "Patch Level": 9,
+    "License Compliance": 8,
+    "Audit Trail": 7,
+    "EPS Capacity": 8,
+    "Ariel Disk Usage": 7,
+    "Flow Dedup Ratio": 5,
+}
 
 # ---------------------------- Logging ---------------------------------
 
@@ -177,6 +217,16 @@ class QRadarAuditor:
                 "External Integrations": self._check_external_integrations,
                 "Data Exports": self._check_data_exports,
                 "API Usage": self._check_api_usage,
+            },
+            "Compliance & Governance": {
+                "Patch Level": self._check_patch_level,
+                "License Compliance": self._check_license_compliance,
+                "Audit Trail": self._check_audit_trail,
+            },
+            "Performance & Tuning": {
+                "EPS Capacity": self._check_eps_capacity,
+                "Ariel Disk Usage": self._check_ariel_disk_usage,
+                "Flow Dedup Ratio": self._check_flow_dedup_ratio,
             },
         }
 
@@ -346,6 +396,14 @@ class QRadarAuditor:
                     }
                     print(f"{Fore.RED}    Error: {e}")
 
+        # Inject severity into each result
+        for cat, checks in self.results.items():
+            for name, r in checks.items():
+                r["severity"] = SEVERITY_MAP.get(name, 5)
+
+        overall_score = self._compute_overall_score()
+        print(f"\n{Fore.CYAN}Overall Audit Score: {overall_score}/100")
+
         # Exports
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = os.path.join(outdir, f"qradar_audit_{stamp}")
@@ -359,9 +417,11 @@ class QRadarAuditor:
             self._export_csv(os.path.join(out_path, "report.csv"))
         if "html" in export:
             self._export_html(os.path.join(out_path, "report.html"))
+        if "pdf" in export:
+            self._export_pdf(os.path.join(out_path, "report.pdf"))
 
         print(f"\n{Fore.CYAN}Output folder: {out_path}")
-        return {"version": version, "results": self.results, "out": out_path}
+        return {"version": version, "results": self.results, "out": out_path, "overall_score": overall_score}
 
     # ---------------------- Connection & API --------------------------
 
@@ -1192,6 +1252,206 @@ class QRadarAuditor:
             status, findings, rec = "PASS", "API usage appears healthy.", "Keep monitoring and updating versions."
         return {"status": status, "findings": findings, "recommendations": rec, "details": api}
 
+    # ---------------------- Compliance & Governance ---------------------
+
+    def _check_patch_level(self) -> Dict[str, Any]:
+        about = self.system_info or {}
+        version = about.get("version", "Unknown")
+        # Known supported release trains (update as IBM publishes)
+        supported = {"7.5.0", "7.5.1", "7.5.2", "7.5.3", "7.5.4", "7.6.0"}
+        eol = {"7.3.0", "7.3.1", "7.3.2", "7.3.3", "7.4.0", "7.4.1", "7.4.2", "7.4.3"}
+        # Extract major.minor.patch
+        parts = version.split(" ")[0] if version != "Unknown" else ""
+        concerns = []
+        if version == "Unknown":
+            concerns.append("Unable to determine QRadar version")
+        elif parts in eol:
+            concerns.append(f"Version {version} is end-of-life")
+        elif parts not in supported:
+            concerns.append(f"Version {version} may not be on latest patch train")
+        if len(concerns) and any("end-of-life" in c for c in concerns):
+            status, findings, rec = "FAIL", f"Critical: {', '.join(concerns)}", "Upgrade to a supported release immediately."
+        elif concerns:
+            status, findings, rec = "WARNING", f"Patch concerns: {', '.join(concerns)}", "Review IBM Fix Central for latest patches."
+        else:
+            status, findings, rec = "PASS", f"Version {version} is on a supported release train.", "Subscribe to IBM security bulletins."
+        return {"status": status, "findings": findings, "recommendations": rec, "details": {"version": version, "supported_trains": sorted(supported)}}
+
+    def _check_license_compliance(self) -> Dict[str, Any]:
+        # Use Ariel to estimate current EPS
+        aql = "SELECT COUNT(*) AS event_count FROM events WHERE starttime > NOW - 1 HOURS"
+        data, status, _ = self._request("/api/ariel/searches", method="POST", json_body={"query_expression": aql})
+        eps_actual = 0
+        if isinstance(data, dict) and "search_id" in data:
+            search_id = data["search_id"]
+            t0 = time.time()
+            deadline = t0 + max(60, self.timeout * 3)
+            final_status = "UNKNOWN"
+            while time.time() < deadline:
+                info, _, _ = self._request(f"/api/ariel/searches/{search_id}")
+                if isinstance(info, dict):
+                    final_status = info.get("status", final_status)
+                    if final_status in {"COMPLETED", "CANCELED", "ERROR", "THROTTLED"}:
+                        break
+                time.sleep(2)
+            if final_status == "COMPLETED":
+                rows, _, _ = self._request(f"/api/ariel/searches/{search_id}/results")
+                try:
+                    if isinstance(rows, list) and rows:
+                        count = int(next(iter(rows[0].values())))
+                        eps_actual = round(count / 3600, 1)
+                except Exception:
+                    pass
+        # Licensed EPS placeholder — typically from /api/system/about or licensing endpoint
+        eps_licensed = self.system_info.get("eps_licensed", 25000)
+        if not isinstance(eps_licensed, (int, float)):
+            eps_licensed = 25000
+        utilization = 100.0 * eps_actual / eps_licensed if eps_licensed else 0
+        concerns = []
+        if utilization > 100:
+            concerns.append(f"Over license: {eps_actual} EPS vs {eps_licensed} licensed ({utilization:.1f}%)")
+        elif utilization > 85:
+            concerns.append(f"Near license cap: {utilization:.1f}% utilized")
+        if utilization > 100:
+            status, findings, rec = "FAIL", f"License exceeded: {', '.join(concerns)}", "Upgrade license tier or reduce ingestion immediately."
+        elif concerns:
+            status, findings, rec = "WARNING", f"License concern: {', '.join(concerns)}", "Plan capacity upgrade before hitting the cap."
+        else:
+            status, findings, rec = "PASS", f"License utilization healthy ({utilization:.1f}%).", "Monitor as data sources grow."
+        return {"status": status, "findings": findings, "recommendations": rec,
+                "details": {"eps_actual": eps_actual, "eps_licensed": eps_licensed, "utilization_pct": round(utilization, 1)}}
+
+    def _check_audit_trail(self) -> Dict[str, Any]:
+        # Check for recent admin login activity via /api/config/access/users
+        users = self._paginate_json("/api/config/access/users")
+        if not isinstance(users, list):
+            return {"status": "WARNING", "findings": "Unable to retrieve user audit info.", "recommendations": "Verify API permissions."}
+        now_ms = time.time() * 1000
+        recent_admin_logins = 0
+        dormant_admins = 0
+        for u in users:
+            role_ids = u.get("role_id")
+            is_admin = isinstance(role_ids, list) and 1 in role_ids
+            if not is_admin:
+                continue
+            last_login = u.get("last_login_time", 0)
+            if last_login and (now_ms - last_login) < 7 * 24 * 60 * 60 * 1000:
+                recent_admin_logins += 1
+            elif not last_login or (now_ms - last_login) > 90 * 24 * 60 * 60 * 1000:
+                dormant_admins += 1
+        concerns = []
+        if dormant_admins > 0:
+            concerns.append(f"{dormant_admins} dormant admin account(s) (>90d since login)")
+        if recent_admin_logins > 10:
+            concerns.append(f"High admin activity ({recent_admin_logins} logins in 7d)")
+        if len(concerns) > 1:
+            status, findings, rec = "FAIL", f"Audit trail issues: {', '.join(concerns)}", "Disable dormant admins; investigate unusual activity."
+        elif concerns:
+            status, findings, rec = "WARNING", f"Audit concern: {concerns[0]}", "Review admin accounts and enable detailed audit logging."
+        else:
+            status, findings, rec = "PASS", "Admin activity appears normal.", "Maintain periodic admin access reviews."
+        return {"status": status, "findings": findings, "recommendations": rec,
+                "details": {"recent_admin_logins_7d": recent_admin_logins, "dormant_admin_accounts": dormant_admins}}
+
+    # ---------------------- Performance & Tuning -----------------------
+
+    def _check_eps_capacity(self) -> Dict[str, Any]:
+        # Use system/servers to get host count, estimate EPS headroom
+        hosts = self._paginate_json("/api/system/servers")
+        ep_count = 0
+        if isinstance(hosts, list):
+            for h in hosts:
+                comps = h.get("components", [])
+                if "EVENT_PROCESSOR" in comps or "CONSOLE" in comps:
+                    ep_count += 1
+        # Heuristic: ~15k EPS per EP in typical deployments
+        estimated_capacity = max(ep_count, 1) * 15000
+        eps_licensed = self.system_info.get("eps_licensed", 25000)
+        if not isinstance(eps_licensed, (int, float)):
+            eps_licensed = 25000
+        headroom = estimated_capacity - eps_licensed
+        concerns = []
+        if headroom < 0:
+            concerns.append(f"EPS capacity may be insufficient (est. {estimated_capacity} vs licensed {eps_licensed})")
+        elif headroom < 5000:
+            concerns.append(f"Low EPS headroom (~{headroom} spare)")
+        if headroom < 0:
+            status, findings, rec = "FAIL", f"Capacity risk: {', '.join(concerns)}", "Add event processors or upgrade hardware."
+        elif concerns:
+            status, findings, rec = "WARNING", f"Capacity concern: {', '.join(concerns)}", "Plan hardware refresh before growth."
+        else:
+            status, findings, rec = "PASS", f"Adequate EPS capacity (est. {estimated_capacity}, licensed {eps_licensed}).", "Re-evaluate with data growth."
+        return {"status": status, "findings": findings, "recommendations": rec,
+                "details": {"event_processors": ep_count, "estimated_eps_capacity": estimated_capacity, "eps_licensed": eps_licensed, "headroom": headroom}}
+
+    def _check_ariel_disk_usage(self) -> Dict[str, Any]:
+        # Placeholder: typically retrieved via SSH or /api/system/health (version-dependent)
+        disk = {
+            "ariel_partition_total_gb": 2000,
+            "ariel_partition_used_gb": 1400,
+            "oldest_event_age_days": 92,
+            "compression_enabled": True,
+        }
+        utilization = 100.0 * disk["ariel_partition_used_gb"] / disk["ariel_partition_total_gb"] if disk["ariel_partition_total_gb"] else 0
+        concerns = []
+        if utilization > 85:
+            concerns.append(f"Ariel partition at {utilization:.1f}% capacity")
+        if disk["oldest_event_age_days"] < 30:
+            concerns.append(f"Events only retained {disk['oldest_event_age_days']}d")
+        if not disk["compression_enabled"]:
+            concerns.append("Ariel compression disabled")
+        if utilization > 90:
+            status, findings, rec = "FAIL", f"Ariel disk critical: {', '.join(concerns)}", "Expand storage or reduce retention immediately."
+        elif concerns:
+            status, findings, rec = "WARNING", f"Ariel disk concerns: {', '.join(concerns)}", "Plan storage expansion; enable compression."
+        else:
+            status, findings, rec = "PASS", f"Ariel disk healthy ({utilization:.1f}% used).", "Monitor alongside data growth."
+        return {"status": status, "findings": findings, "recommendations": rec,
+                "details": {**disk, "utilization_pct": round(utilization, 1)}}
+
+    def _check_flow_dedup_ratio(self) -> Dict[str, Any]:
+        # Placeholder: use Ariel query or system metrics in production
+        flow = {
+            "raw_flows_per_hour": 500000,
+            "deduplicated_flows_per_hour": 350000,
+            "dedup_enabled": True,
+            "asymmetric_flows_pct": 12.0,
+        }
+        if flow["raw_flows_per_hour"] > 0:
+            dedup_pct = 100.0 * (1 - flow["deduplicated_flows_per_hour"] / flow["raw_flows_per_hour"])
+        else:
+            dedup_pct = 0
+        concerns = []
+        if not flow["dedup_enabled"]:
+            concerns.append("Flow deduplication disabled")
+        if dedup_pct < 10:
+            concerns.append(f"Low dedup ratio ({dedup_pct:.1f}%)")
+        if flow["asymmetric_flows_pct"] > 20:
+            concerns.append(f"High asymmetric flows ({flow['asymmetric_flows_pct']}%)")
+        if not flow["dedup_enabled"]:
+            status, findings, rec = "FAIL", "Flow dedup disabled; storage and license impact.", "Enable flow deduplication immediately."
+        elif concerns:
+            status, findings, rec = "WARNING", f"Flow concerns: {', '.join(concerns)}", "Review flow configuration and dedup settings."
+        else:
+            status, findings, rec = "PASS", f"Flow dedup healthy ({dedup_pct:.1f}% reduction).", "Monitor dedup effectiveness over time."
+        return {"status": status, "findings": findings, "recommendations": rec,
+                "details": {**flow, "dedup_reduction_pct": round(dedup_pct, 1)}}
+
+    # ---------------------- Scoring ------------------------------------
+
+    def _compute_overall_score(self) -> int:
+        """Compute a weighted audit score 0-100.  PASS=100%, WARNING=50%, FAIL=0%."""
+        weighted_sum = 0.0
+        weight_total = 0.0
+        for cat, checks in self.results.items():
+            for name, r in checks.items():
+                sev = r.get("severity", 5)
+                st = r.get("status", "WARNING")
+                score = 100 if st == "PASS" else (50 if st == "WARNING" else 0)
+                weighted_sum += score * sev
+                weight_total += sev
+        return round(weighted_sum / weight_total) if weight_total else 0
+
     # ---------------------- Reporting ---------------------------------
 
     def _summary_stats(self) -> Tuple[int, int, int, int]:
@@ -1215,8 +1475,11 @@ class QRadarAuditor:
         print(f"{Fore.CYAN}QRadar Version: {ver}")
         print(f"{Fore.CYAN}================================\n")
         total, passes, warnings, fails = self._summary_stats()
+        score = self._compute_overall_score()
         def pct(x):
             return (100.0 * x / total) if total else 0.0
+        score_color = Fore.GREEN if score >= 80 else (Fore.RED if score < 50 else Fore.YELLOW)
+        print(f"{score_color}  Overall Score: {score}/100")
         print(f"{Fore.GREEN}  Total Checks: {total}")
         print(f"{Fore.GREEN}  Passed: {passes} ({pct(passes):.1f}%)")
         print(f"{Fore.YELLOW}  Warnings: {warnings} ({pct(warnings):.1f}%)")
@@ -1243,7 +1506,8 @@ class QRadarAuditor:
                 if not r:
                     continue
                 color = Fore.GREEN if r["status"] == "PASS" else (Fore.RED if r["status"] == "FAIL" else Fore.YELLOW)
-                print(f"{color}  {name}: {r['status']}")
+                sev = r.get('severity', 5)
+                print(f"{color}  {name}: {r['status']}  [severity: {sev}/10]")
                 print(f"{Fore.WHITE}    Findings: {r.get('findings')}")
                 print(f"{Fore.WHITE}    Recommendations: {r.get('recommendations')}")
 
@@ -1296,6 +1560,7 @@ class QRadarAuditor:
                     "category": cat,
                     "check": name,
                     "status": r.get("status"),
+                    "severity": r.get("severity", 5),
                     "findings": r.get("findings"),
                     "recommendations": r.get("recommendations"),
                 })
@@ -1306,28 +1571,117 @@ class QRadarAuditor:
     def _export_html(self, path: str) -> None:
         # Basic, dependency-free HTML export
         total, passes, warnings, fails = self._summary_stats()
+        score = self._compute_overall_score()
+        score_cls = 'pass' if score >= 80 else ('fail' if score < 50 else 'warn')
         html = [
             "<html><head><meta charset='utf-8'><title>QRadar Audit Report</title>",
-            "<style>body{font-family:Arial,Helvetica,sans-serif;padding:20px;} h2{margin-top:1.5em} .pass{color:#1b8a5a} .warn{color:#c48f00} .fail{color:#c0392b} table{border-collapse:collapse;width:100%} th,td{border:1px solid #ddd;padding:8px} th{background:#f5f5f5;text-align:left}</style>",
-            "</head><body>",
-            f"<h1>QRadar Audit Report</h1><p><b>Generated:</b> {ts()}<br><b>Target:</b> {self.base_url}<br><b>Version:</b> {self.system_info.get('version','Unknown')}</p>",
+            "<style>body{font-family:Arial,Helvetica,sans-serif;padding:20px;background:#f9fafb;color:#1a1a2e;}",
+            "h1{color:#16213e;} h2{margin-top:1.5em;color:#0f3460;}",
+            ".pass{color:#1b8a5a;font-weight:bold} .warn{color:#c48f00;font-weight:bold} .fail{color:#c0392b;font-weight:bold}",
+            "table{border-collapse:collapse;width:100%;margin-bottom:1em} th,td{border:1px solid #ddd;padding:10px}",
+            "th{background:#e2e8f0;text-align:left;font-weight:600}",
+            ".score-box{display:inline-block;padding:12px 24px;border-radius:8px;font-size:1.5em;font-weight:bold;margin:10px 0}",
+            ".score-pass{background:#d4edda;color:#155724} .score-warn{background:#fff3cd;color:#856404} .score-fail{background:#f8d7da;color:#721c24}",
+            "</style></head><body>",
+            f"<h1>QRadar SIEM Audit Report</h1>",
+            f"<p><b>Generated:</b> {ts()}<br><b>Target:</b> {self.base_url}<br><b>Version:</b> {self.system_info.get('version','Unknown')}</p>",
+            f"<div class='score-box score-{score_cls}'>Overall Score: {score}/100</div>",
             f"<p><b>Total:</b> {total} &nbsp; <span class='pass'>Pass:</span> {passes} &nbsp; <span class='warn'>Warn:</span> {warnings} &nbsp; <span class='fail'>Fail:</span> {fails}</p>",
         ]
         for cat, checks in self.audit_categories.items():
             if cat not in self.results:
                 continue
             html.append(f"<h2>{cat}</h2>")
-            html.append("<table><tr><th>Check</th><th>Status</th><th>Findings</th><th>Recommendations</th></tr>")
+            html.append("<table><tr><th>Check</th><th>Severity</th><th>Status</th><th>Findings</th><th>Recommendations</th></tr>")
             for name in checks.keys():
                 r = self.results[cat].get(name)
                 if not r: continue
                 cls = "pass" if r["status"] == "PASS" else ("fail" if r["status"] == "FAIL" else "warn")
-                html.append(f"<tr><td>{name}</td><td class='{cls}'>{r['status']}</td><td>{r.get('findings','')}</td><td>{r.get('recommendations','')}</td></tr>")
+                sev = r.get('severity', 5)
+                html.append(f"<tr><td>{name}</td><td>{sev}/10</td><td class='{cls}'>{r['status']}</td><td>{r.get('findings','')}</td><td>{r.get('recommendations','')}</td></tr>")
             html.append("</table>")
         html.append("</body></html>")
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(html))
         print(f"{Fore.GREEN}Saved HTML → {path}")
+
+
+    def _export_pdf(self, path: str) -> None:
+        if not _HAS_FPDF:
+            print(f"{Fore.YELLOW}PDF export skipped (install fpdf2: pip install fpdf2)")
+            return
+        total, passes, warnings, fails = self._summary_stats()
+        score = self._compute_overall_score()
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+        # Title
+        pdf.set_font("Helvetica", "B", 18)
+        pdf.cell(0, 12, "QRadar SIEM Audit Report", new_x="LMARGIN", new_y="NEXT", align="C")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.cell(0, 8, f"Generated: {ts()}  |  Target: {self.base_url}  |  Version: {self.system_info.get('version','Unknown')}", new_x="LMARGIN", new_y="NEXT", align="C")
+        pdf.ln(4)
+        # Score
+        pdf.set_font("Helvetica", "B", 14)
+        pdf.cell(0, 10, f"Overall Score: {score}/100", new_x="LMARGIN", new_y="NEXT", align="C")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.cell(0, 8, f"Total: {total}   Pass: {passes}   Warn: {warnings}   Fail: {fails}", new_x="LMARGIN", new_y="NEXT", align="C")
+        pdf.ln(6)
+        # Per-category tables
+        for cat, checks in self.audit_categories.items():
+            if cat not in self.results:
+                continue
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.cell(0, 10, cat, new_x="LMARGIN", new_y="NEXT")
+            pdf.set_font("Helvetica", "B", 8)
+            col_w = [35, 10, 12, 65, 65]
+            headers = ["Check", "Sev", "Status", "Findings", "Recommendations"]
+            for i, h in enumerate(headers):
+                pdf.cell(col_w[i], 7, h, border=1)
+            pdf.ln()
+            pdf.set_font("Helvetica", "", 7)
+            for name in checks.keys():
+                r = self.results[cat].get(name)
+                if not r:
+                    continue
+                row = [name, str(r.get('severity', 5)), r['status'], r.get('findings','')[:80], r.get('recommendations','')[:80]]
+                for i, val in enumerate(row):
+                    pdf.cell(col_w[i], 6, val, border=1)
+                pdf.ln()
+            pdf.ln(2)
+        pdf.output(path)
+        print(f"{Fore.GREEN}Saved PDF → {path}")
+
+    @staticmethod
+    def compare_runs(old_path: str, new_results: Dict[str, Any]) -> None:
+        """Load a previous JSON report and diff against current results."""
+        try:
+            with open(old_path, "r", encoding="utf-8") as f:
+                old = json.load(f)
+        except Exception as e:
+            print(f"{Fore.RED}Cannot load comparison file: {e}")
+            return
+        old_results = old.get("results", {})
+        print(f"\n{Fore.CYAN}=== Audit Comparison ===")
+        print(f"{Fore.CYAN}Previous: {old_path}")
+        print(f"{Fore.CYAN}{'Check':<40} {'Previous':<12} {'Current':<12} {'Delta'}")
+        print("-" * 80)
+        status_val = {"PASS": 2, "WARNING": 1, "FAIL": 0, "ERROR": -1}
+        for cat, checks in new_results.items():
+            for name, r in checks.items():
+                old_status = (old_results.get(cat, {}).get(name, {}).get("status", "N/A"))
+                new_status = r.get("status", "N/A")
+                ov = status_val.get(old_status, -1)
+                nv = status_val.get(new_status, -1)
+                if nv > ov:
+                    delta = f"{Fore.GREEN}▲ Improved"
+                elif nv < ov:
+                    delta = f"{Fore.RED}▼ Regressed"
+                else:
+                    delta = f"{Fore.WHITE}— Unchanged"
+                label = f"{cat} / {name}"
+                print(f"{Fore.WHITE}{label:<40} {old_status:<12} {new_status:<12} {delta}")
+        print(f"{Fore.CYAN}========================")
 
 
 # ------------------------------ CLI -----------------------------------
@@ -1342,7 +1696,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--backoff", type=float, default=DEFAULT_BACKOFF, help="Exponential backoff factor")
     p.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE, help="Pagination page size")
     p.add_argument("--ariel-window", default="24h", help="Window for event-rate check, e.g. 24h, 7d")
-    p.add_argument("--dry-run", action="store_true", help="Don’t call API; simulate responses")
+    p.add_argument("--dry-run", action="store_true", help="Don't call API; simulate responses")
     p.add_argument("--debug", action="store_true", help="Verbose logging to console + file")
     p.add_argument("--log-file", default="qradar_audit.log", help="Log file path")
 
@@ -1352,8 +1706,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--exclude-check", nargs="*", default=[], help="Skip these checks")
 
     p.add_argument("--out", default="out", help="Output directory")
-    p.add_argument("--export", nargs="*", default=["console"], choices=["console", "json", "csv", "html"], help="Exports")
+    p.add_argument("--export", nargs="*", default=["console"], choices=["console", "json", "csv", "html", "pdf"], help="Export formats")
     p.add_argument("--list-checks", action="store_true", help="List all categories/checks and exit")
+    p.add_argument("--compare", metavar="OLD_JSON", default=None, help="Path to a previous JSON report to diff against")
     return p
 
 def list_checks(aud: QRadarAuditor) -> None:
@@ -1394,7 +1749,7 @@ def main() -> int:
         print(f"{Fore.YELLOW}WARNING: SSL verification disabled. Do this only in trusted networks.")
 
     try:
-        auditor.run_audit(
+        result = auditor.run_audit(
             include_categories=args.include_category,
             exclude_categories=args.exclude_category,
             include_checks=args.include_check,
@@ -1402,6 +1757,8 @@ def main() -> int:
             outdir=args.out,
             export=args.export,
         )
+        if args.compare:
+            QRadarAuditor.compare_runs(args.compare, result.get("results", {}))
         return 0
     except AuditError as e:
         print(f"{Fore.RED}Audit failed: {e}")

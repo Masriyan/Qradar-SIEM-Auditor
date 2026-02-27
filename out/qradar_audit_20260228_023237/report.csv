@@ -1,0 +1,30 @@
+category,check,status,severity,findings,recommendations
+Data Collection,Log Sources,FAIL,9,No log sources configured.,Onboard critical log sources to ensure visibility.
+Data Collection,Event Collection Rate,WARNING,8,Unable to start Ariel search for event count.,Check Ariel permissions and logs; try increasing --timeout.
+Data Collection,Log Source Coverage,FAIL,7,Poor coverage: 0.0%,"Add: Firewall, IDS/IPS, Authentication, Operating System, Network Device, Database, Web Server, Endpoint, Cloud Service, Active Directory"
+Data Collection,Log Source Status,PASS,7,Low issue rate: 0.0%,Continue monitoring.
+System Configuration,System Health,PASS,8,Health within acceptable ranges.,Continue regular monitoring.
+System Configuration,Deployment Architecture,WARNING,6,Unable to retrieve deployment info.,Ensure user has admin API role.
+System Configuration,Storage Utilization,PASS,8,Healthy utilization (64.0%).,Keep monitoring.
+System Configuration,Backup Configuration,FAIL,9,Critical backup issues: Last backup > 197 days ago,Implement/validate robust backup strategy now.
+Security Configuration,User Access Controls,PASS,9,User access controls look reasonable.,Maintain least-privilege and quarterly review cadence.
+Security Configuration,Password Policies,PASS,7,Password policy meets best practices.,Review annually.
+Security Configuration,Network Security,PASS,8,Network hardening looks reasonable.,Maintain secure baseline and review periodically.
+Security Configuration,Authentication Methods,WARNING,8,Auth is OK but could be enhanced.,Enable MFA
+Detection Capabilities,Custom Rules,WARNING,7,Rule concerns: Low custom rules (0),Tune/retire noisy/stale rules; add targeted detections.
+Detection Capabilities,Offense Configuration,PASS,8,Offense handling appears timely.,Sustain current process; expand automation.
+Detection Capabilities,Rule Coverage,WARNING,7,Moderate coverage 68.3%,"Improve: Defense Evasion, Discovery"
+Detection Capabilities,Reference Sets,WARNING,6,"Ref set concerns: Few reference sets (0), Missing common TI sets: Malicious IPs, Malicious Domains, Suspicious User Agents, TOR Exit Nodes",Review and optimize reference data.
+Operational Efficiency,Search Performance,PASS,5,Search performance is healthy.,Monitor as data grows.
+Operational Efficiency,Report Configuration,WARNING,4,Reports OK but could be enhanced.,Add more distribution methods
+Operational Efficiency,Dashboard Configuration,PASS,4,Dashboards look comprehensive.,Refine based on SOC needs.
+Operational Efficiency,Retention Policies,WARNING,7,Retention OK but can improve.,Enable archiving
+Integration & Data Flow,External Integrations,WARNING,6,Integration concerns: Integrations in error: 1,Fix failing connectors; enrich workflow.
+Integration & Data Flow,Data Exports,WARNING,5,Export concerns: Last export > 196 days,Fix schedules and destination health.
+Integration & Data Flow,API Usage,PASS,5,API usage appears healthy.,Keep monitoring and updating versions.
+Compliance & Governance,Patch Level,WARNING,9,Patch concerns: Unable to determine QRadar version,Review IBM Fix Central for latest patches.
+Compliance & Governance,License Compliance,PASS,8,License utilization healthy (0.0%).,Monitor as data sources grow.
+Compliance & Governance,Audit Trail,PASS,7,Admin activity appears normal.,Maintain periodic admin access reviews.
+Performance & Tuning,EPS Capacity,FAIL,8,Capacity risk: EPS capacity may be insufficient (est. 15000 vs licensed 25000),Add event processors or upgrade hardware.
+Performance & Tuning,Ariel Disk Usage,PASS,7,Ariel disk healthy (70.0% used).,Monitor alongside data growth.
+Performance & Tuning,Flow Dedup Ratio,PASS,5,Flow dedup healthy (30.0% reduction).,Monitor dedup effectiveness over time.

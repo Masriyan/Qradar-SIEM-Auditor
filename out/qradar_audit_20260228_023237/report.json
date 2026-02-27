@@ -1,0 +1,476 @@
+{
+  "system": {},
+  "results": {
+    "Data Collection": {
+      "Log Sources": {
+        "status": "FAIL",
+        "findings": "No log sources configured.",
+        "recommendations": "Onboard critical log sources to ensure visibility.",
+        "details": {
+          "total": 0,
+          "enabled": 0,
+          "status_counts": {}
+        },
+        "severity": 9
+      },
+      "Event Collection Rate": {
+        "status": "WARNING",
+        "findings": "Unable to start Ariel search for event count.",
+        "recommendations": "Check Ariel permissions and logs; try increasing --timeout.",
+        "severity": 8
+      },
+      "Log Source Coverage": {
+        "status": "FAIL",
+        "findings": "Poor coverage: 0.0%",
+        "recommendations": "Add: Firewall, IDS/IPS, Authentication, Operating System, Network Device, Database, Web Server, Endpoint, Cloud Service, Active Directory",
+        "details": {
+          "coverage_percentage": 0.0,
+          "covered_types": 0,
+          "total_types": 10,
+          "missing_types": [
+            "Firewall",
+            "IDS/IPS",
+            "Authentication",
+            "Operating System",
+            "Network Device",
+            "Database",
+            "Web Server",
+            "Endpoint",
+            "Cloud Service",
+            "Active Directory"
+          ]
+        },
+        "severity": 7
+      },
+      "Log Source Status": {
+        "status": "PASS",
+        "findings": "Low issue rate: 0.0%",
+        "recommendations": "Continue monitoring.",
+        "details": {
+          "status_counts": {
+            "Active": 0,
+            "Error": 0,
+            "Warning": 0,
+            "Disabled": 0,
+            "Unknown": 0
+          },
+          "problem_percentage": 0.0,
+          "problem_sources": []
+        },
+        "severity": 7
+      }
+    },
+    "System Configuration": {
+      "System Health": {
+        "status": "PASS",
+        "findings": "Health within acceptable ranges.",
+        "recommendations": "Continue regular monitoring.",
+        "details": {
+          "cpu_utilization": 65,
+          "memory_utilization": 72,
+          "disk_io_utilization": 40,
+          "event_processing_delay": 2.5,
+          "services_status": "All services running"
+        },
+        "severity": 8
+      },
+      "Deployment Architecture": {
+        "status": "WARNING",
+        "findings": "Unable to retrieve deployment info.",
+        "recommendations": "Ensure user has admin API role.",
+        "severity": 6
+      },
+      "Storage Utilization": {
+        "status": "PASS",
+        "findings": "Healthy utilization (64.0%).",
+        "recommendations": "Keep monitoring.",
+        "details": {
+          "utilization_percentage": 64.0,
+          "remaining_days_at_current_rate": 42,
+          "total_storage_gb": 5000,
+          "used_storage_gb": 3200,
+          "free_storage_gb": 1800,
+          "retention_periods": {
+            "events": 90,
+            "flows": 30,
+            "assets": 180
+          }
+        },
+        "severity": 8
+      },
+      "Backup Configuration": {
+        "status": "FAIL",
+        "findings": "Critical backup issues: Last backup > 197 days ago",
+        "recommendations": "Implement/validate robust backup strategy now.",
+        "details": {
+          "backup_enabled": true,
+          "backup_frequency": "Daily",
+          "last_successful_backup": "2025-08-15T02:30:00",
+          "backup_retention": 14,
+          "backup_location": "Remote NFS",
+          "configuration_included": true,
+          "data_included": false,
+          "last_backup_age_hours": 4728.043737247222
+        },
+        "severity": 9
+      }
+    },
+    "Security Configuration": {
+      "User Access Controls": {
+        "status": "PASS",
+        "findings": "User access controls look reasonable.",
+        "recommendations": "Maintain least-privilege and quarterly review cadence.",
+        "details": {
+          "total_users": 0,
+          "admin_count": 0,
+          "inactive_users": 0,
+          "default_users": 0
+        },
+        "severity": 9
+      },
+      "Password Policies": {
+        "status": "PASS",
+        "findings": "Password policy meets best practices.",
+        "recommendations": "Review annually.",
+        "details": {
+          "minimum_length": 12,
+          "complexity_required": true,
+          "expiration_days": 90,
+          "history_size": 5,
+          "lockout_threshold": 5,
+          "lockout_duration_minutes": 30
+        },
+        "severity": 7
+      },
+      "Network Security": {
+        "status": "PASS",
+        "findings": "Network hardening looks reasonable.",
+        "recommendations": "Maintain secure baseline and review periodically.",
+        "details": {
+          "https_enabled": true,
+          "tls_version": "TLS 1.2",
+          "weak_ciphers_disabled": true,
+          "console_accessible_ips": [
+            "10.0.0.0/8",
+            "192.168.0.0/16"
+          ],
+          "ssh_enabled": true,
+          "ssh_root_login_disabled": true,
+          "firewall_enabled": true,
+          "unnecessary_services_disabled": true
+        },
+        "severity": 8
+      },
+      "Authentication Methods": {
+        "status": "WARNING",
+        "findings": "Auth is OK but could be enhanced.",
+        "recommendations": "Enable MFA",
+        "details": {
+          "local_auth_enabled": true,
+          "ldap_enabled": true,
+          "ldap_servers": 2,
+          "ldap_failover_configured": true,
+          "ldap_ssl_enabled": true,
+          "radius_enabled": false,
+          "saml_enabled": false,
+          "mfa_enabled": false
+        },
+        "severity": 8
+      }
+    },
+    "Detection Capabilities": {
+      "Custom Rules": {
+        "status": "WARNING",
+        "findings": "Rule concerns: Low custom rules (0)",
+        "recommendations": "Tune/retire noisy/stale rules; add targeted detections.",
+        "details": {
+          "total_rules": 0,
+          "enabled_rules": 0,
+          "custom_rules": 0,
+          "disabled_rules": 0,
+          "never_triggered": 0,
+          "stale_rules": 0
+        },
+        "severity": 7
+      },
+      "Offense Configuration": {
+        "status": "PASS",
+        "findings": "Offense handling appears timely.",
+        "recommendations": "Sustain current process; expand automation.",
+        "details": {
+          "total_active": 0,
+          "unassigned": 0,
+          "aging": {
+            "0-1 days": 0,
+            "1-7 days": 0,
+            "7-30 days": 0,
+            "30+ days": 0
+          }
+        },
+        "severity": 8
+      },
+      "Rule Coverage": {
+        "status": "WARNING",
+        "findings": "Moderate coverage 68.3%",
+        "recommendations": "Improve: Defense Evasion, Discovery",
+        "details": {
+          "overall": 68.33333333333333,
+          "by_tactic": {
+            "Initial Access": 70,
+            "Execution": 85,
+            "Persistence": 60,
+            "Privilege Escalation": 65,
+            "Defense Evasion": 55,
+            "Credential Access": 80,
+            "Discovery": 50,
+            "Lateral Movement": 75,
+            "Collection": 60,
+            "Exfiltration": 70,
+            "Command and Control": 85,
+            "Impact": 65
+          },
+          "gaps": [
+            "Defense Evasion",
+            "Discovery"
+          ]
+        },
+        "severity": 7
+      },
+      "Reference Sets": {
+        "status": "WARNING",
+        "findings": "Ref set concerns: Few reference sets (0), Missing common TI sets: Malicious IPs, Malicious Domains, Suspicious User Agents, TOR Exit Nodes",
+        "recommendations": "Review and optimize reference data.",
+        "details": {
+          "total_sets": 0,
+          "empty_sets": 0,
+          "stale_sets": 0,
+          "missing_ti_sets": [
+            "Malicious IPs",
+            "Malicious Domains",
+            "Suspicious User Agents",
+            "TOR Exit Nodes"
+          ]
+        },
+        "severity": 6
+      }
+    },
+    "Operational Efficiency": {
+      "Search Performance": {
+        "status": "PASS",
+        "findings": "Search performance is healthy.",
+        "recommendations": "Monitor as data grows.",
+        "details": {
+          "avg_search_time": 45,
+          "search_timeout_rate": 0.05,
+          "long_running_searches": 3,
+          "indexed_fields": 35,
+          "custom_properties": 28,
+          "search_optimizations_enabled": true
+        },
+        "severity": 5
+      },
+      "Report Configuration": {
+        "status": "WARNING",
+        "findings": "Reports OK but could be enhanced.",
+        "recommendations": "Add more distribution methods",
+        "details": {
+          "total_reports": 12,
+          "scheduled_reports": 8,
+          "report_distribution": {
+            "Compliance": 4,
+            "Executive": 2,
+            "Operational": 5,
+            "Custom": 1
+          },
+          "report_formats": [
+            "PDF",
+            "CSV"
+          ],
+          "distribution_methods": [
+            "Email"
+          ]
+        },
+        "severity": 4
+      },
+      "Dashboard Configuration": {
+        "status": "PASS",
+        "findings": "Dashboards look comprehensive.",
+        "recommendations": "Refine based on SOC needs.",
+        "details": {
+          "total_dashboards": 8,
+          "custom_dashboards": 5,
+          "role_specific_dashboards": 3,
+          "dashboard_items": {
+            "Time Series": 12,
+            "Tables": 8,
+            "Bar": 6,
+            "Pie": 4,
+            "Attack Maps": 2,
+            "Custom": 3
+          }
+        },
+        "severity": 4
+      },
+      "Retention Policies": {
+        "status": "WARNING",
+        "findings": "Retention OK but can improve.",
+        "recommendations": "Enable archiving",
+        "details": {
+          "event_retention_days": 90,
+          "flow_retention_days": 30,
+          "retention_by_log_source": {
+            "Authentication logs": 180,
+            "Firewall logs": 90,
+            "IDS logs": 90,
+            "OS logs": 30,
+            "Application logs": 30
+          },
+          "custom_retention_policies": 3,
+          "data_compression_enabled": true,
+          "archive_enabled": false
+        },
+        "severity": 7
+      }
+    },
+    "Integration & Data Flow": {
+      "External Integrations": {
+        "status": "WARNING",
+        "findings": "Integration concerns: Integrations in error: 1",
+        "recommendations": "Fix failing connectors; enrich workflow.",
+        "details": {
+          "active_integrations": [
+            "Email",
+            "SIEM Forwarding",
+            "Vulnerability Scanner",
+            "Ticket System"
+          ],
+          "integration_status": {
+            "Email": "Working",
+            "SIEM Forwarding": "Working",
+            "Vulnerability Scanner": "Error",
+            "Ticket System": "Working"
+          },
+          "bidirectional_integrations": 1
+        },
+        "severity": 6
+      },
+      "Data Exports": {
+        "status": "WARNING",
+        "findings": "Export concerns: Last export > 196 days",
+        "recommendations": "Fix schedules and destination health.",
+        "details": {
+          "configured_exports": 2,
+          "export_destinations": [
+            "SIEM",
+            "Data Lake"
+          ],
+          "exported_data_types": [
+            "Events",
+            "Flows"
+          ],
+          "export_frequency": "Hourly",
+          "last_successful_export": "2025-08-15T08:30:00",
+          "export_age_hours": 4722.043737352778
+        },
+        "severity": 5
+      },
+      "API Usage": {
+        "status": "PASS",
+        "findings": "API usage appears healthy.",
+        "recommendations": "Keep monitoring and updating versions.",
+        "details": {
+          "authorized_api_clients": 5,
+          "api_calls_per_day": 1200,
+          "api_errors_per_day": 15,
+          "api_throttling_enabled": true,
+          "api_versions_in_use": [
+            "v14.0",
+            "v13.0"
+          ],
+          "deprecated_api_usage": false
+        },
+        "severity": 5
+      }
+    },
+    "Compliance & Governance": {
+      "Patch Level": {
+        "status": "WARNING",
+        "findings": "Patch concerns: Unable to determine QRadar version",
+        "recommendations": "Review IBM Fix Central for latest patches.",
+        "details": {
+          "version": "Unknown",
+          "supported_trains": [
+            "7.5.0",
+            "7.5.1",
+            "7.5.2",
+            "7.5.3",
+            "7.5.4",
+            "7.6.0"
+          ]
+        },
+        "severity": 9
+      },
+      "License Compliance": {
+        "status": "PASS",
+        "findings": "License utilization healthy (0.0%).",
+        "recommendations": "Monitor as data sources grow.",
+        "details": {
+          "eps_actual": 0,
+          "eps_licensed": 25000,
+          "utilization_pct": 0.0
+        },
+        "severity": 8
+      },
+      "Audit Trail": {
+        "status": "PASS",
+        "findings": "Admin activity appears normal.",
+        "recommendations": "Maintain periodic admin access reviews.",
+        "details": {
+          "recent_admin_logins_7d": 0,
+          "dormant_admin_accounts": 0
+        },
+        "severity": 7
+      }
+    },
+    "Performance & Tuning": {
+      "EPS Capacity": {
+        "status": "FAIL",
+        "findings": "Capacity risk: EPS capacity may be insufficient (est. 15000 vs licensed 25000)",
+        "recommendations": "Add event processors or upgrade hardware.",
+        "details": {
+          "event_processors": 0,
+          "estimated_eps_capacity": 15000,
+          "eps_licensed": 25000,
+          "headroom": -10000
+        },
+        "severity": 8
+      },
+      "Ariel Disk Usage": {
+        "status": "PASS",
+        "findings": "Ariel disk healthy (70.0% used).",
+        "recommendations": "Monitor alongside data growth.",
+        "details": {
+          "ariel_partition_total_gb": 2000,
+          "ariel_partition_used_gb": 1400,
+          "oldest_event_age_days": 92,
+          "compression_enabled": true,
+          "utilization_pct": 70.0
+        },
+        "severity": 7
+      },
+      "Flow Dedup Ratio": {
+        "status": "PASS",
+        "findings": "Flow dedup healthy (30.0% reduction).",
+        "recommendations": "Monitor dedup effectiveness over time.",
+        "details": {
+          "raw_flows_per_hour": 500000,
+          "deduplicated_flows_per_hour": 350000,
+          "dedup_enabled": true,
+          "asymmetric_flows_pct": 12.0,
+          "dedup_reduction_pct": 30.0
+        },
+        "severity": 5
+      }
+    }
+  }
+}

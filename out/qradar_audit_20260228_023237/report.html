@@ -1,0 +1,67 @@
+<html><head><meta charset='utf-8'><title>QRadar Audit Report</title>
+<style>body{font-family:Arial,Helvetica,sans-serif;padding:20px;background:#f9fafb;color:#1a1a2e;}
+h1{color:#16213e;} h2{margin-top:1.5em;color:#0f3460;}
+.pass{color:#1b8a5a;font-weight:bold} .warn{color:#c48f00;font-weight:bold} .fail{color:#c0392b;font-weight:bold}
+table{border-collapse:collapse;width:100%;margin-bottom:1em} th,td{border:1px solid #ddd;padding:10px}
+th{background:#e2e8f0;text-align:left;font-weight:600}
+.score-box{display:inline-block;padding:12px 24px;border-radius:8px;font-size:1.5em;font-weight:bold;margin:10px 0}
+.score-pass{background:#d4edda;color:#155724} .score-warn{background:#fff3cd;color:#856404} .score-fail{background:#f8d7da;color:#721c24}
+</style></head><body>
+<h1>QRadar SIEM Audit Report</h1>
+<p><b>Generated:</b> 2026-02-28 02:32:37<br><b>Target:</b> https://dummy<br><b>Version:</b> Unknown</p>
+<div class='score-box score-warn'>Overall Score: 66/100</div>
+<p><b>Total:</b> 29 &nbsp; <span class='pass'>Pass:</span> 14 &nbsp; <span class='warn'>Warn:</span> 11 &nbsp; <span class='fail'>Fail:</span> 4</p>
+<h2>Data Collection</h2>
+<table><tr><th>Check</th><th>Severity</th><th>Status</th><th>Findings</th><th>Recommendations</th></tr>
+<tr><td>Log Sources</td><td>9/10</td><td class='fail'>FAIL</td><td>No log sources configured.</td><td>Onboard critical log sources to ensure visibility.</td></tr>
+<tr><td>Event Collection Rate</td><td>8/10</td><td class='warn'>WARNING</td><td>Unable to start Ariel search for event count.</td><td>Check Ariel permissions and logs; try increasing --timeout.</td></tr>
+<tr><td>Log Source Coverage</td><td>7/10</td><td class='fail'>FAIL</td><td>Poor coverage: 0.0%</td><td>Add: Firewall, IDS/IPS, Authentication, Operating System, Network Device, Database, Web Server, Endpoint, Cloud Service, Active Directory</td></tr>
+<tr><td>Log Source Status</td><td>7/10</td><td class='pass'>PASS</td><td>Low issue rate: 0.0%</td><td>Continue monitoring.</td></tr>
+</table>
+<h2>System Configuration</h2>
+<table><tr><th>Check</th><th>Severity</th><th>Status</th><th>Findings</th><th>Recommendations</th></tr>
+<tr><td>System Health</td><td>8/10</td><td class='pass'>PASS</td><td>Health within acceptable ranges.</td><td>Continue regular monitoring.</td></tr>
+<tr><td>Deployment Architecture</td><td>6/10</td><td class='warn'>WARNING</td><td>Unable to retrieve deployment info.</td><td>Ensure user has admin API role.</td></tr>
+<tr><td>Storage Utilization</td><td>8/10</td><td class='pass'>PASS</td><td>Healthy utilization (64.0%).</td><td>Keep monitoring.</td></tr>
+<tr><td>Backup Configuration</td><td>9/10</td><td class='fail'>FAIL</td><td>Critical backup issues: Last backup > 197 days ago</td><td>Implement/validate robust backup strategy now.</td></tr>
+</table>
+<h2>Security Configuration</h2>
+<table><tr><th>Check</th><th>Severity</th><th>Status</th><th>Findings</th><th>Recommendations</th></tr>
+<tr><td>User Access Controls</td><td>9/10</td><td class='pass'>PASS</td><td>User access controls look reasonable.</td><td>Maintain least-privilege and quarterly review cadence.</td></tr>
+<tr><td>Password Policies</td><td>7/10</td><td class='pass'>PASS</td><td>Password policy meets best practices.</td><td>Review annually.</td></tr>
+<tr><td>Network Security</td><td>8/10</td><td class='pass'>PASS</td><td>Network hardening looks reasonable.</td><td>Maintain secure baseline and review periodically.</td></tr>
+<tr><td>Authentication Methods</td><td>8/10</td><td class='warn'>WARNING</td><td>Auth is OK but could be enhanced.</td><td>Enable MFA</td></tr>
+</table>
+<h2>Detection Capabilities</h2>
+<table><tr><th>Check</th><th>Severity</th><th>Status</th><th>Findings</th><th>Recommendations</th></tr>
+<tr><td>Custom Rules</td><td>7/10</td><td class='warn'>WARNING</td><td>Rule concerns: Low custom rules (0)</td><td>Tune/retire noisy/stale rules; add targeted detections.</td></tr>
+<tr><td>Offense Configuration</td><td>8/10</td><td class='pass'>PASS</td><td>Offense handling appears timely.</td><td>Sustain current process; expand automation.</td></tr>
+<tr><td>Rule Coverage</td><td>7/10</td><td class='warn'>WARNING</td><td>Moderate coverage 68.3%</td><td>Improve: Defense Evasion, Discovery</td></tr>
+<tr><td>Reference Sets</td><td>6/10</td><td class='warn'>WARNING</td><td>Ref set concerns: Few reference sets (0), Missing common TI sets: Malicious IPs, Malicious Domains, Suspicious User Agents, TOR Exit Nodes</td><td>Review and optimize reference data.</td></tr>
+</table>
+<h2>Operational Efficiency</h2>
+<table><tr><th>Check</th><th>Severity</th><th>Status</th><th>Findings</th><th>Recommendations</th></tr>
+<tr><td>Search Performance</td><td>5/10</td><td class='pass'>PASS</td><td>Search performance is healthy.</td><td>Monitor as data grows.</td></tr>
+<tr><td>Report Configuration</td><td>4/10</td><td class='warn'>WARNING</td><td>Reports OK but could be enhanced.</td><td>Add more distribution methods</td></tr>
+<tr><td>Dashboard Configuration</td><td>4/10</td><td class='pass'>PASS</td><td>Dashboards look comprehensive.</td><td>Refine based on SOC needs.</td></tr>
+<tr><td>Retention Policies</td><td>7/10</td><td class='warn'>WARNING</td><td>Retention OK but can improve.</td><td>Enable archiving</td></tr>
+</table>
+<h2>Integration & Data Flow</h2>
+<table><tr><th>Check</th><th>Severity</th><th>Status</th><th>Findings</th><th>Recommendations</th></tr>
+<tr><td>External Integrations</td><td>6/10</td><td class='warn'>WARNING</td><td>Integration concerns: Integrations in error: 1</td><td>Fix failing connectors; enrich workflow.</td></tr>
+<tr><td>Data Exports</td><td>5/10</td><td class='warn'>WARNING</td><td>Export concerns: Last export > 196 days</td><td>Fix schedules and destination health.</td></tr>
+<tr><td>API Usage</td><td>5/10</td><td class='pass'>PASS</td><td>API usage appears healthy.</td><td>Keep monitoring and updating versions.</td></tr>
+</table>
+<h2>Compliance & Governance</h2>
+<table><tr><th>Check</th><th>Severity</th><th>Status</th><th>Findings</th><th>Recommendations</th></tr>
+<tr><td>Patch Level</td><td>9/10</td><td class='warn'>WARNING</td><td>Patch concerns: Unable to determine QRadar version</td><td>Review IBM Fix Central for latest patches.</td></tr>
+<tr><td>License Compliance</td><td>8/10</td><td class='pass'>PASS</td><td>License utilization healthy (0.0%).</td><td>Monitor as data sources grow.</td></tr>
+<tr><td>Audit Trail</td><td>7/10</td><td class='pass'>PASS</td><td>Admin activity appears normal.</td><td>Maintain periodic admin access reviews.</td></tr>
+</table>
+<h2>Performance & Tuning</h2>
+<table><tr><th>Check</th><th>Severity</th><th>Status</th><th>Findings</th><th>Recommendations</th></tr>
+<tr><td>EPS Capacity</td><td>8/10</td><td class='fail'>FAIL</td><td>Capacity risk: EPS capacity may be insufficient (est. 15000 vs licensed 25000)</td><td>Add event processors or upgrade hardware.</td></tr>
+<tr><td>Ariel Disk Usage</td><td>7/10</td><td class='pass'>PASS</td><td>Ariel disk healthy (70.0% used).</td><td>Monitor alongside data growth.</td></tr>
+<tr><td>Flow Dedup Ratio</td><td>5/10</td><td class='pass'>PASS</td><td>Flow dedup healthy (30.0% reduction).</td><td>Monitor dedup effectiveness over time.</td></tr>
+</table>
+</body></html>
